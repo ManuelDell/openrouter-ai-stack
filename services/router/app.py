@@ -218,7 +218,7 @@ async def inject_memories(messages: list[Message], query: str) -> list[Message]:
                 memories = resp.json().get("memories", [])
                 if memories:
                     ctx = "Relevant context from previous sessions:\n" + "\n".join(
-                        f"- {m['content']}" for m in memories
+                        f"- Q: {m['query']}\n  A: {m['response']}" for m in memories
                     )
                     system_msg = Message(role="system", content=ctx)
                     # Prepend after existing system messages
