@@ -1,0 +1,197 @@
+# ============================================================
+# OpenRouter AI Coding Stack - Production Ready
+# Portainer LXC / Docker Compose
+# ============================================================
+# Services:
+#   - ai-router    : Smart routing FastAPI (port 8085)
+#   - memory-svc   : Hindsight-compatible memory layer (port 8086)
+#   - mcp-server   : MCP server for VSCode (port 8087)
+#   - open-webui   : Web Chat UI für Browser (port 8088)
+#   - redis        : Rate limiting + response cache
+# ============================================================
+
+name: openrouter-ai-stack
+
+x-common: &common
+  restart: unless-stopped
+  networks:
+    - ai-net
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+# ─── SERVICES ────────────────────────────────────────────────
+
+services:
+
+  # ── Redis: Cache + Rate Limiting ──────────────────────────
+  redis:
+    <<: *common
+    image: redis:7-alpine
+    container_name: ai-redis
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --requirepass "${REDIS_PASSWORD}"
+      --save 60 1
+      --loglevel warning
+    volumes:
+      - /data/compose/openrouter-ai-stack/data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels:
+      - "com.openrouter.service=cache"
+
+  # ── Memory Service: Hindsight-compatible ──────────────────
+  memory-svc:
+    <<: *common
+    image: ghcr.io/manueldell/openrouter-ai-stack/memory:latest
+    container_name: ai-memory
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
+      - MEMORY_DB_PATH=/data/memory/hindsight.db
+      - MAX_MEMORIES=10000
+      - SIMILARITY_THRESHOLD=${SIMILARITY_THRESHOLD:-0.3}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - /data/compose/openrouter-ai-stack/data/memory:/data/memory
+      - /data/compose/openrouter-ai-stack/logs:/app/logs
+    ports:
+      - "127.0.0.1:8086:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    labels:
+      - "com.openrouter.service=memory"
+
+  # ── Smart Router: Auto-routing to OpenRouter ───────────────
+  ai-router:
+    <<: *common
+    image: ghcr.io/manueldell/openrouter-ai-stack/router:latest
+    container_name: ai-router
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - OPENROUTER_BASE_URL=${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - MEMORY_SERVICE_URL=http://memory-svc:8081
+      # Model configuration
+      - MODEL_VISION=${MODEL_VISION:-qwen/qwen3-vl}
+      - MODEL_COMPLEX=${MODEL_COMPLEX:-qwen/qwen3-vl}
+      - MODEL_FAST=${MODEL_FAST:-deepseek/deepseek-v3.2}
+      - MODEL_FALLBACK=${MODEL_FALLBACK:-google/gemini-3.1-flash-lite-preview}
+      # Routing thresholds
+      - COMPLEXITY_THRESHOLD=${COMPLEXITY_THRESHOLD:-150}
+      - CACHE_TTL=${CACHE_TTL:-3600}
+      - RATE_LIMIT_RPM=${RATE_LIMIT_RPM:-60}
+      # App config
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - APP_TITLE=OpenRouter AI Router
+      - HTTP_REFERER=${HTTP_REFERER:-http://localhost:8080}
+      - X_TITLE=${X_TITLE:-OpenRouter AI Stack}
+    volumes:
+      - /data/compose/openrouter-ai-stack/logs:/app/logs
+    ports:
+      - "${ROUTER_PORT:-8085}:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+      memory-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    labels:
+      - "com.openrouter.service=router"
+
+  # ── MCP Server: VSCode Integration ────────────────────────
+  mcp-server:
+    <<: *common
+    image: ghcr.io/manueldell/openrouter-ai-stack/mcp:latest
+    container_name: ai-mcp
+    environment:
+      - ROUTER_URL=http://ai-router:8080
+      - MEMORY_URL=http://memory-svc:8081
+      - MCP_PORT=8082
+      - MCP_SECRET=${MCP_SECRET}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - /data/compose/openrouter-ai-stack/logs:/app/logs
+    ports:
+      - "${MCP_PORT:-8087}:8082"
+    depends_on:
+      ai-router:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    labels:
+      - "com.openrouter.service=mcp"
+
+  # ── Open WebUI: Browser Chat Interface ────────────────────
+  open-webui:
+    <<: *common
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: ai-webui
+    environment:
+      # Verbinde mit dem Smart Router (OpenAI-kompatibel)
+      - OPENAI_API_BASE_URL=http://ai-router:8080/v1
+      - OPENAI_API_KEY=openrouter-via-proxy
+      # Deaktiviere Ollama (nicht benötigt)
+      - ENABLE_OLLAMA_API=false
+      # Auth aktiviert → jeder braucht eigenen Account (Signup nur durch Admin)
+      - WEBUI_AUTH=true
+      - ENABLE_SIGNUP=false
+      # Standard-Modell: DeepSeek (günstig)
+      - DEFAULT_MODELS=deepseek/deepseek-v3.2
+      # UI Titel
+      # Sicherheit
+      - WEBUI_SECRET_KEY=${MCP_SECRET}
+      # Streaming aktivieren
+      - ENABLE_WEBSOCKET_SUPPORT=true
+      # Modell-Zugriff für alle User (kein Filter)
+      - ENABLE_MODEL_FILTER=false
+      # Standard-User-Rolle
+      - DEFAULT_USER_ROLE=user
+      # User dürfen eigene Chats verwalten
+      - USER_PERMISSIONS_CHAT_DELETION=true
+      - USER_PERMISSIONS_CHAT_EDIT=true
+    volumes:
+      - /data/compose/openrouter-ai-stack/data/webui:/app/backend/data
+    ports:
+      - "${WEBUI_PORT:-8088}:8080"
+    depends_on:
+      ai-router:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    labels:
+      - "com.openrouter.service=webui"
+
+# ─── NETWORKS ────────────────────────────────────────────────
+
+networks:
+  ai-net:
+    name: openrouter-ai-net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

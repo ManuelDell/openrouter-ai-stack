@@ -1,0 +1,66 @@
+{
+  "models": [
+    {
+      "title": "OpenRouter Auto (Smart Routing)",
+      "provider": "openai",
+      "model": "openrouter-auto",
+      "apiBase": "http://DEINE-SERVER-IP:8085/v1",
+      "apiKey": "not-required",
+      "systemMessage": "You are an expert software engineer. Be precise, concise, and write production-quality code."
+    },
+    {
+      "title": "Qwen3-VL (Vision + Complex)",
+      "provider": "openai",
+      "model": "qwen/qwen3-vl",
+      "apiBase": "http://DEINE-SERVER-IP:8085/v1",
+      "apiKey": "not-required"
+    },
+    {
+      "title": "DeepSeek V3.2 (Fast)",
+      "provider": "openai",
+      "model": "deepseek/deepseek-v3.2",
+      "apiBase": "http://DEINE-SERVER-IP:8085/v1",
+      "apiKey": "not-required"
+    }
+  ],
+  "tabAutocompleteModel": {
+    "title": "DeepSeek Fast",
+    "provider": "openai",
+    "model": "deepseek/deepseek-v3.2",
+    "apiBase": "http://DEINE-SERVER-IP:8085/v1",
+    "apiKey": "not-required"
+  },
+  "mcpServers": [
+    {
+      "name": "OpenRouter MCP",
+      "transport": {
+        "type": "http",
+        "url": "http://DEINE-SERVER-IP:8087/mcp"
+      }
+    }
+  ],
+  "customCommands": [
+    {
+      "name": "review",
+      "prompt": "Review this code for bugs, security issues, and improvements. Be specific.",
+      "description": "Code Review via Qwen3-VL"
+    },
+    {
+      "name": "explain",
+      "prompt": "Explain this code step by step. Mention any non-obvious patterns.",
+      "description": "Code Explanation"
+    }
+  ],
+  "contextProviders": [
+    {"name": "diff",      "params": {}},
+    {"name": "open",      "params": {}},
+    {"name": "terminal",  "params": {}},
+    {"name": "directory", "params": {}}
+  ],
+  "slashCommands": [
+    {"name": "edit",    "description": "Edit code inline"},
+    {"name": "comment", "description": "Add comments"},
+    {"name": "fix",     "description": "Fix bugs or errors"},
+    {"name": "tests",   "description": "Generate tests"}
+  ]
+}

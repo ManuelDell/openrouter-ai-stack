@@ -1,0 +1,85 @@
+{
+  // ============================================================
+  // VSCode Settings — OpenRouter AI Stack Integration
+  // Continue Extension: https://marketplace.visualstudio.com/items?itemName=Continue.continue
+  // ============================================================
+
+  // ── Continue Extension (AI Coding Assistant) ──────────────
+  "continue.models": [
+    {
+      "title":    "OpenRouter Auto (Smart Routing)",
+      "provider": "openai",
+      "model":    "openrouter-auto",
+      "apiBase":  "http://localhost:8085/v1",
+      "apiKey":   "not-required",
+      "systemMessage": "You are an expert software engineer. Be precise, concise, and write production-quality code."
+    },
+    {
+      "title":    "Qwen3-VL (Vision + Complex)",
+      "provider": "openai",
+      "model":    "qwen/qwen3-vl",
+      "apiBase":  "http://localhost:8085/v1",
+      "apiKey":   "not-required"
+    },
+    {
+      "title":    "DeepSeek V3.2 (Fast)",
+      "provider": "openai",
+      "model":    "deepseek/deepseek-v3.2",
+      "apiBase":  "http://localhost:8085/v1",
+      "apiKey":   "not-required"
+    }
+  ],
+
+  // MCP Servers für erweiterte Tools
+  "continue.mcpServers": [
+    {
+      "name":    "OpenRouter MCP",
+      "url":     "http://localhost:8087/mcp",
+      "type":    "http"
+    }
+  ],
+
+  // Tab-Completion via Smart Router
+  "continue.tabAutocompleteModel": {
+    "title":    "DeepSeek Fast",
+    "provider": "openai",
+    "model":    "deepseek/deepseek-v3.2",
+    "apiBase":  "http://localhost:8085/v1",
+    "apiKey":   "not-required"
+  },
+
+  // ── GitHub Copilot (falls installiert) ────────────────────
+  // Copilot nutzt direkt OpenAI — kein Override möglich ohne Extension
+
+  // ── Editor Settings ───────────────────────────────────────
+  "editor.inlineSuggest.enabled":         true,
+  "editor.suggestSelection":              "first",
+  "editor.quickSuggestions": {
+    "other":    "on",
+    "comments": "off",
+    "strings":  "on"
+  },
+  "editor.acceptSuggestionOnCommitCharacter": false,
+  "editor.wordBasedSuggestions":          "off",
+
+  // ── Terminal ──────────────────────────────────────────────
+  "terminal.integrated.env.linux": {
+    "OPENAI_API_BASE": "http://localhost:8085/v1",
+    "OPENAI_API_KEY":  "openrouter-via-proxy"
+  },
+
+  // ── Python ────────────────────────────────────────────────
+  "python.defaultInterpreterPath": "/usr/bin/python3",
+  "[python]": {
+    "editor.formatOnSave":      true,
+    "editor.defaultFormatter":  "ms-python.black-formatter"
+  },
+
+  // ── Files ─────────────────────────────────────────────────
+  "files.exclude": {
+    "**/__pycache__":    true,
+    "**/*.pyc":          true,
+    "**/node_modules":   true,
+    "**/.env":           true
+  }
+}
