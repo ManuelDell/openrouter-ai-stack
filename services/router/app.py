@@ -145,15 +145,19 @@ def _is_complex(text: str) -> bool:
     return any(kw in text_lower for kw in COMPLEX_KEYWORDS)
 
 
+KNOWN_MODELS = {MODEL_VISION, MODEL_COMPLEX, MODEL_FAST, MODEL_FALLBACK}
+
 def select_model(request: ChatRequest) -> str:
     """
     Routing decision tree:
       image?   → MODEL_VISION
       complex? → MODEL_COMPLEX
       else     → MODEL_FAST
-    Manual override via request.model respected.
+    Manual override only for exact known model IDs.
+    Generic names (auto, gpt-4, claude-*, deepseek-*, ...) trigger auto-routing.
     """
-    if request.model:
+    if request.model and request.model in KNOWN_MODELS:
+        log.info("Route: MANUAL → %s", request.model)
         return request.model
 
     if _has_image(request.messages):
