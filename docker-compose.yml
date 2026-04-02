@@ -94,6 +94,8 @@ services:
       # Routing thresholds
       - RESEARCH_MAX_URLS=${RESEARCH_MAX_URLS:-3}
       - SEARXNG_URL=http://searxng:8080
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - WHISPER_MODEL=${WHISPER_MODEL:-whisper-large-v3-turbo}
       - COMPLEXITY_THRESHOLD=${COMPLEXITY_THRESHOLD:-150}
       - CACHE_TTL=${CACHE_TTL:-3600}
       - RATE_LIMIT_RPM=${RATE_LIMIT_RPM:-60}
@@ -213,6 +215,7 @@ services:
       - "${SEARXNG_PORT:-8091}:8080"
     labels:
       - "com.openrouter.service=searxng"
+
 
 # ─── NETWORKS ────────────────────────────────────────────────
 

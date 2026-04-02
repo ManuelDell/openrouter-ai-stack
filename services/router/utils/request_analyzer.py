@@ -13,14 +13,12 @@ from typing import Optional
 RESEARCH_COMMANDS = {"/recherchiere", "/research", "/search", "/suche"}
 
 RESEARCH_KEYWORDS = {
-    # German
-    "aktuell", "neueste", "aktuelles", "heute", "neulich", "gerade",
-    "nachrichten", "news", "recherchiere",
-    # English
-    "current", "latest", "today", "recently", "breaking", "news",
-    "what happened", "right now", "as of",
-    # Year hints
-    "2025", "2026",
+    # German — only explicit news/research intent
+    "nachrichten", "aktueller stand", "breaking news",
+    "was ist passiert", "neueste meldungen",
+    # English — only explicit news/research intent
+    "breaking news", "what happened", "latest news",
+    "what's new", "whats new",
 }
 
 URL_PATTERN = re.compile(r"https?://\S+")

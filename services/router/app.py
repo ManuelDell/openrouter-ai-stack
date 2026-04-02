@@ -23,7 +23,7 @@ from typing import Any, AsyncGenerator, Optional
 
 import httpx
 import redis.asyncio as aioredis
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException, Depends, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 from utils.cost_tracker import store_cost
 from utils.request_analyzer import detect_research_trigger, detect_imagegen_trigger, detect_audio_trigger
 from routes.cost_routes import router as cost_router
-from dispatchers import research_dispatcher
+from dispatchers import research_dispatcher, audio_dispatcher
 
 # ─── Logging ─────────────────────────────────────────────────
 
@@ -66,6 +66,11 @@ COMPLEX_KEYWORDS = set(
         "implement,algorithm,performance,security,database,system,framework",
     ).split(",")
 )
+
+MODEL_AUDIO        = os.getenv("MODEL_AUDIO", "xiaomi/mimo-v2-omni")
+GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")
+GROQ_WHISPER_URL   = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-large-v3-turbo")
 
 # ─── App ─────────────────────────────────────────────────────
 
@@ -468,10 +473,16 @@ async def chat_completions(request: Request, body: ChatRequest):
     client_ip = request.client.host if request.client else "unknown"
     await check_rate_limit(client_ip, redis)
 
-    # Check for special dispatchers first
-    user_text = _extract_text(body.messages)
+    # Only check the last user message for dispatch triggers —
+    # checking all messages causes false positives on injected system context.
+    last_user_msgs = [m for m in body.messages if m.role == "user"]
+    last_user_text = _extract_text([last_user_msgs[-1]]) if last_user_msgs else ""
 
-    if detect_research_trigger(user_text):
+    audio_triggered, display_mode = detect_audio_trigger(last_user_text)
+    if audio_triggered:
+        log.info("Dispatch: AUDIO (text command, mode=%s)", display_mode)
+
+    if detect_research_trigger(last_user_text):
         log.info("Dispatch: RESEARCH → %s", os.getenv("MODEL_SEARCH", "perplexity/sonar"))
         msgs = [m.model_dump() for m in body.messages]
         return StreamingResponse(
@@ -551,3 +562,119 @@ async def route_info(body: ChatRequest):
         "word_count":      len(text.split()),
         "threshold":       COMPLEXITY_THRESHOLD,
     }
+
+
+def _audio_mime(filename: str, content_type: Optional[str]) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return {
+        "mp3": "audio/mpeg", "wav": "audio/wav", "m4a": "audio/mp4",
+        "ogg": "audio/ogg", "webm": "audio/webm", "flac": "audio/flac",
+    }.get(ext, content_type or "audio/mpeg")
+
+
+async def _transcribe_via_openrouter(audio_bytes: bytes, filename: str, language: Optional[str]) -> str:
+    """Send audio as base64 to MiMo-V2-Omni via OpenRouter chat completions."""
+    audio_b64 = base64.b64encode(audio_bytes).decode()
+    fmt = filename.rsplit(".", 1)[-1].lower() if "." in filename else "mp3"
+
+    prompt = "Transcribe this audio exactly. Return only the transcription text, nothing else."
+    if language:
+        prompt += f" The audio is in {language}."
+
+    payload = {
+        "model": MODEL_AUDIO,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_audio", "input_audio": {"data": audio_b64, "format": fmt}},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
+    }
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(
+            f"{BASE_URL}/chat/completions",
+            headers=_or_headers(),
+            json=payload,
+        )
+        resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
+
+
+async def _transcribe_via_groq(audio_bytes: bytes, filename: str, language: Optional[str]) -> str:
+    """Fallback: Groq Whisper API (requires GROQ_API_KEY)."""
+    data: dict = {"model": GROQ_WHISPER_MODEL, "response_format": "text"}
+    if language:
+        data["language"] = language
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(
+            GROQ_WHISPER_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            files={"file": (filename, audio_bytes, _audio_mime(filename, None))},
+            data=data,
+        )
+        resp.raise_for_status()
+    return resp.text.strip()
+
+
+@app.post("/v1/audio/transcriptions")
+async def audio_transcriptions(
+    file: UploadFile = File(...),
+    model: str = Form(default="whisper-1"),
+    language: Optional[str] = Form(default=None),
+    response_format: str = Form(default="json"),
+    temperature: float = Form(default=0.0),
+):
+    """
+    OpenAI-compatible audio transcription.
+    Primary: MiMo-V2-Omni via OpenRouter (no extra key needed).
+    Fallback: Groq Whisper (if GROQ_API_KEY is set).
+    """
+    audio_bytes = await file.read()
+    filename = file.filename or "audio.wav"
+    transcript = ""
+    model_used = MODEL_AUDIO
+
+    # Primary: MiMo-V2-Omni via OpenRouter
+    try:
+        transcript = await _transcribe_via_openrouter(audio_bytes, filename, language)
+        log.info("Transcribed '%s' via %s (%d chars)", filename, MODEL_AUDIO, len(transcript))
+    except Exception as e:
+        log.warning("MiMo-V2-Omni transcription failed: %s — trying Groq fallback", e)
+        # Fallback: Groq Whisper
+        if GROQ_API_KEY:
+            try:
+                transcript = await _transcribe_via_groq(audio_bytes, filename, language)
+                model_used = f"groq/{GROQ_WHISPER_MODEL}"
+                log.info("Transcribed '%s' via Groq (%d chars)", filename, len(transcript))
+            except Exception as e2:
+                log.error("Groq fallback also failed: %s", e2)
+                raise HTTPException(status_code=503, detail=f"Transcription failed: {e2}")
+        else:
+            raise HTTPException(status_code=503, detail=f"Transcription failed: {e}")
+
+    # Store transcript in memory (background)
+    async def _mem_store(t=transcript, fn=filename):
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as c:
+                await c.post(
+                    f"{MEMORY_URL}/store",
+                    json={"query": f"[audio] {fn}",
+                          "response": t[:2000],
+                          "metadata": {"type": "audio_transcript"}},
+                )
+        except Exception as ex:
+            log.debug("Memory store for audio failed: %s", ex)
+
+    asyncio.create_task(_mem_store())
+    asyncio.create_task(asyncio.to_thread(
+        store_cost, model_used, 0, 0, 0.0, "audio", "transcription", 0
+    ))
+
+    if response_format == "text":
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(transcript)
+
+    return JSONResponse({"text": transcript})
