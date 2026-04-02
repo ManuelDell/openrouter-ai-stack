@@ -28,6 +28,9 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from utils.cost_tracker import store_cost
+from routes.cost_routes import router as cost_router
+
 # ─── Logging ─────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -65,6 +68,7 @@ COMPLEX_KEYWORDS = set(
 # ─── App ─────────────────────────────────────────────────────
 
 app = FastAPI(title="OpenRouter Smart Router", version="1.0.0")
+app.include_router(cost_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -146,6 +150,18 @@ def _is_complex(text: str) -> bool:
 
 
 KNOWN_MODELS = {MODEL_VISION, MODEL_COMPLEX, MODEL_FAST, MODEL_FALLBACK}
+
+def detect_feature(request: ChatRequest, model: str) -> str:
+    """Map routing decision to a feature label for cost tracking."""
+    if _has_image(request.messages):
+        return "vision"
+    text = _extract_text(request.messages)
+    if _is_complex(text):
+        return "complex"
+    if model == MODEL_FALLBACK:
+        return "fallback"
+    return "standard"
+
 
 def select_model(request: ChatRequest) -> str:
     """
@@ -381,26 +397,47 @@ async def _stream_and_remember(
     messages: list[Message],
     temperature: Optional[float],
     max_tokens: Optional[int],
+    feature: str = "standard",
 ) -> AsyncGenerator[bytes, None]:
     """
     Proper streaming generator:
     - httpx client lifetime is fully enclosed here (no premature close)
     - collects response text for background memory storage
+    - extracts usage from final SSE chunk for cost tracking
     """
     full_response: list[str] = []
+    t_start = time.monotonic()
+    usage: dict = {}
 
     async for chunk in stream_with_fallback(model, messages, temperature, max_tokens):
         yield chunk
         for line in chunk.decode(errors="ignore").split("\n"):
-            if line.startswith("data: ") and line != "data: [DONE]":
-                try:
-                    delta = json.loads(line[6:])["choices"][0].get("delta", {}).get("content", "")
-                    if delta:
-                        full_response.append(delta)
-                except Exception:
-                    pass
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            try:
+                parsed = json.loads(line[6:])
+                delta = parsed["choices"][0].get("delta", {}).get("content", "")
+                if delta:
+                    full_response.append(delta)
+                if "usage" in parsed:
+                    usage = parsed["usage"]
+            except Exception:
+                pass
 
+    latency_ms = int((time.monotonic() - t_start) * 1000)
     asyncio.create_task(store_interaction(messages, "".join(full_response)))
+
+    if usage:
+        asyncio.create_task(asyncio.to_thread(
+            store_cost,
+            model,
+            usage.get("prompt_tokens", 0),
+            usage.get("completion_tokens", 0),
+            usage.get("cost", 0.0),
+            feature,
+            None,
+            latency_ms,
+        ))
 
 # ─── Routes ──────────────────────────────────────────────────
 
@@ -431,6 +468,7 @@ async def chat_completions(request: Request, body: ChatRequest):
 
     # Select model via routing logic
     model = select_model(body)
+    feature = detect_feature(body, model)
 
     # Inject memories from previous sessions
     messages = body.messages
@@ -450,7 +488,7 @@ async def chat_completions(request: Request, body: ChatRequest):
     # ── Streaming path ───────────────────────────────────────
     if body.stream:
         return StreamingResponse(
-            _stream_and_remember(model, messages, body.temperature, body.max_tokens),
+            _stream_and_remember(model, messages, body.temperature, body.max_tokens, feature),
             media_type="text/event-stream",
             headers={
                 "Cache-Control":    "no-cache",
@@ -467,14 +505,21 @@ async def chat_completions(request: Request, body: ChatRequest):
     # Inject routing metadata
     result["_routing"] = {"requested": model, "used": used_model}
 
-    # Cache + store memory async
+    # Cache + store memory + track cost async
     asyncio.create_task(set_cached(cache_key, result, redis))
-    response_text = (
-        result.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-    )
+    response_text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
     asyncio.create_task(store_interaction(messages, response_text))
+
+    usage = result.get("usage", {})
+    if usage:
+        asyncio.create_task(asyncio.to_thread(
+            store_cost,
+            used_model,
+            usage.get("prompt_tokens", 0),
+            usage.get("completion_tokens", 0),
+            usage.get("cost", 0.0),
+            feature,
+        ))
 
     return JSONResponse(result)
 

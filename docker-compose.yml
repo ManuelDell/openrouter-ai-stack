@@ -7,6 +7,7 @@
 #   - memory-svc   : Hindsight-compatible memory layer (port 8086)
 #   - mcp-server   : MCP server for VSCode (port 8087)
 #   - open-webui   : Web Chat UI für Browser (port 8088)
+#   - or-observer  : Cost dashboard (port 8089)
 #   - redis        : Rate limiting + response cache
 # ============================================================
 
@@ -94,6 +95,7 @@ services:
       - COMPLEXITY_THRESHOLD=${COMPLEXITY_THRESHOLD:-150}
       - CACHE_TTL=${CACHE_TTL:-3600}
       - RATE_LIMIT_RPM=${RATE_LIMIT_RPM:-60}
+      - COST_DB_PATH=/data/costs/cost_log.db
       # App config
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - APP_TITLE=OpenRouter AI Router
@@ -101,6 +103,7 @@ services:
       - X_TITLE=${X_TITLE:-OpenRouter AI Stack}
     volumes:
       - /data/compose/openrouter-ai-stack/logs:/app/logs
+      - /data/compose/openrouter-ai-stack/data/costs:/data/costs
     ports:
       - "${ROUTER_PORT:-8085}:8080"
     depends_on:
