@@ -92,6 +92,8 @@ services:
       - MODEL_FAST=${MODEL_FAST:-deepseek/deepseek-v3.2}
       - MODEL_FALLBACK=${MODEL_FALLBACK:-google/gemini-3.1-flash-lite-preview}
       # Routing thresholds
+      - RESEARCH_MAX_URLS=${RESEARCH_MAX_URLS:-3}
+      - RESEARCH_DDG_REGION=${RESEARCH_DDG_REGION:-de-de}
       - COMPLEXITY_THRESHOLD=${COMPLEXITY_THRESHOLD:-150}
       - CACHE_TTL=${CACHE_TTL:-3600}
       - RATE_LIMIT_RPM=${RATE_LIMIT_RPM:-60}
