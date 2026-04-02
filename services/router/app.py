@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 from utils.cost_tracker import store_cost
 from utils.request_analyzer import detect_research_trigger, detect_imagegen_trigger, detect_audio_trigger
 from routes.cost_routes import router as cost_router
-from dispatchers import research_dispatcher, audio_dispatcher
+from dispatchers import research_dispatcher, audio_dispatcher, imagegen_dispatcher
 
 # ─── Logging ─────────────────────────────────────────────────
 
@@ -482,8 +482,19 @@ async def chat_completions(request: Request, body: ChatRequest):
     if audio_triggered:
         log.info("Dispatch: AUDIO (text command, mode=%s)", display_mode)
 
+    triggered_imagegen, _ = detect_imagegen_trigger(last_user_text)
+    if triggered_imagegen:
+        log.info("Dispatch: IMAGEGEN → %s", os.getenv("MODEL_IMAGEGEN", "black-forest-labs/flux-schnell"))
+        msgs = [m.model_dump() for m in body.messages]
+        return StreamingResponse(
+            imagegen_dispatcher.handle(msgs),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                     "X-Model-Routed": "imagegen"},
+        )
+
     if detect_research_trigger(last_user_text):
-        log.info("Dispatch: RESEARCH → %s", os.getenv("MODEL_SEARCH", "perplexity/sonar"))
+        log.info("Dispatch: RESEARCH")
         msgs = [m.model_dump() for m in body.messages]
         return StreamingResponse(
             research_dispatcher.handle(msgs, body.stream, body.temperature, body.max_tokens),
