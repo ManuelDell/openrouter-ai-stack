@@ -458,6 +458,7 @@ async def health():
 async def list_models():
     """Return available models in OpenAI-compatible format."""
     models = [
+        {"id": "auto",         "object": "model", "owned_by": "openrouter", "role": "auto-routing"},
         {"id": MODEL_VISION,   "object": "model", "owned_by": "openrouter", "role": "vision+complex"},
         {"id": MODEL_FAST,     "object": "model", "owned_by": "openrouter", "role": "fast"},
         {"id": MODEL_FALLBACK, "object": "model", "owned_by": "openrouter", "role": "fallback"},

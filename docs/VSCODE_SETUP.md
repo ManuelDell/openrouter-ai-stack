@@ -114,37 +114,35 @@ VS Code → Extensions → "Continue" von Continue
 
 #### Konfiguration
 
-Datei öffnen: `~/.continue/config.json`
+Datei öffnen: `~/.continue/config.yaml`
 
-```json
-{
-  "models": [
-    {
-      "title": "OpenRouter Auto",
-      "provider": "openai",
-      "model": "auto",
-      "apiBase": "http://DEINE-SERVER-IP:8085/v1",
-      "apiKey": "openrouter-via-proxy"
-    }
-  ],
-  "tabAutocompleteModel": {
-    "title": "OpenRouter Autocomplete",
-    "provider": "openai",
-    "model": "auto",
-    "apiBase": "http://DEINE-SERVER-IP:8085/v1",
-    "apiKey": "openrouter-via-proxy"
-  },
-  "mcpServers": [
-    {
-      "name": "OpenRouter AI Stack",
-      "url": "http://DEINE-SERVER-IP:8087/mcp",
-      "type": "http"
-    }
-  ]
-}
+```yaml
+name: OpenRouter AI Stack
+version: 1.0.0
+schema: v1
+
+models:
+  - name: OpenRouter Auto
+    provider: openai
+    model: auto
+    apiBase: http://DEINE-SERVER-IP:8085/v1
+    apiKey: openrouter-via-proxy
+
+tabAutocompleteModel:
+  name: OpenRouter Autocomplete
+  provider: openai
+  model: auto
+  apiBase: http://DEINE-SERVER-IP:8085/v1
+  apiKey: openrouter-via-proxy
+
+mcpServers:
+  - name: OpenRouter AI Stack
+    url: http://DEINE-SERVER-IP:8087/mcp
 ```
 
-> Eine fertige Vorlage liegt im Repo unter [`continue.config.example.json`](../continue.config.example.json).
+> **Wichtig:** Der Header (`name`, `version`, `schema`) ist Pflicht — ohne ihn ignoriert Continue die gesamte Konfiguration.
+
+> Eine fertige Vorlage liegt im Repo unter [`continue.config.example.yaml`](../continue.config.example.yaml).
 
 #### Shortcuts
 

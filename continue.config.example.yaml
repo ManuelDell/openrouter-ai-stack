@@ -1,0 +1,21 @@
+name: OpenRouter AI Stack
+version: 1.0.0
+schema: v1
+
+models:
+  - name: OpenRouter Auto
+    provider: openai
+    model: auto
+    apiBase: http://DEINE-SERVER-IP:8085/v1
+    apiKey: openrouter-via-proxy
+
+tabAutocompleteModel:
+  name: OpenRouter Autocomplete
+  provider: openai
+  model: auto
+  apiBase: http://DEINE-SERVER-IP:8085/v1
+  apiKey: openrouter-via-proxy
+
+mcpServers:
+  - name: OpenRouter AI Stack
+    url: http://DEINE-SERVER-IP:8087/mcp
