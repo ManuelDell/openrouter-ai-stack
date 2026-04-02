@@ -278,6 +278,20 @@ docker compose down -v
 
 ---
 
+## Features & Roadmap
+
+| Feature | Status | Beschreibung |
+|---------|--------|-------------|
+| Smart Routing | ✅ Aktiv | Automatisches Routing auf Vision/Complex/Fast/Fallback |
+| Memory System | ✅ Aktiv | Kontextinjizierung aus vergangenen Gesprächen (TF-IDF) |
+| Web Research | ✅ Aktiv | Selbst gehostete SearXNG-Suche + Seitenextraktion |
+| Audio Transkription | ✅ Aktiv | MiMo-V2-Omni via OpenRouter, Groq Whisper als Fallback |
+| Cost Tracking | ✅ Aktiv | SQLite-Protokollierung jedes API-Calls, Abfrage via `/api/costs/*` |
+| Bildgenerierung | ⏳ Vorbereitet | **Noch nicht aktiv** — OpenRouter gibt Bilddaten nicht in API-Responses zurück (Stand: April 2026). Der Dispatcher ist implementiert und wird aktiviert sobald OpenRouter Image-Output unterstützt. Alternativ: DALL-E Key im Open WebUI Admin Panel hinterlegen. |
+| Authentik SSO | ⏳ Vorbereitet | OAuth2/OIDC-Block in docker-compose auskommentiert, aktivierbar sobald Authentik läuft |
+
+---
+
 ## Troubleshooting
 
 **Router antwortet nicht:**

@@ -47,10 +47,16 @@ def extract_urls(text: str) -> list[str]:
 
 IMAGEGEN_COMMANDS = {"/imagegen", "/generate", "/bild", "/erstelle-bild"}
 
-IMAGEGEN_KEYWORDS = {
-    "generate image", "create image", "draw", "erstelle ein bild",
-    "zeichne", "generiere ein bild", "make an image",
+# Exact substring phrases
+IMAGEGEN_PHRASES = {
+    "generate image", "create image", "erstelle ein bild", "generiere ein bild",
+    "make an image", "als bild generieren", "als bild erstellen",
+    "ein bild von", "ein foto von",
 }
+
+# Verb + noun word-pair detection (both must appear as separate words)
+_IMG_VERBS = {"generiere", "generier", "zeichne", "erstelle", "male", "draw", "create", "generate"}
+_IMG_NOUNS = {"bild", "image", "foto", "grafik", "illustration", "photo", "picture"}
 
 
 def detect_imagegen_trigger(text: str) -> tuple[bool, float]:
@@ -58,7 +64,10 @@ def detect_imagegen_trigger(text: str) -> tuple[bool, float]:
     lower = text.lower()
     if any(cmd in lower for cmd in IMAGEGEN_COMMANDS):
         return True, 1.0
-    if any(kw in lower for kw in IMAGEGEN_KEYWORDS):
+    if any(phrase in lower for phrase in IMAGEGEN_PHRASES):
+        return True, 0.9
+    words = set(lower.split())
+    if words & _IMG_VERBS and words & _IMG_NOUNS:
         return True, 0.8
     return False, 0.0
 
