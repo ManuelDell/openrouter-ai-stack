@@ -19,7 +19,6 @@ import time
 from typing import AsyncGenerator, Optional
 
 import httpx
-from duckduckgo_search import DDGS
 
 from utils.content_fetcher import fetch_or_screenshot
 from utils.cost_tracker import store_cost
@@ -32,7 +31,7 @@ BASE_URL     = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 MODEL_VISION = os.getenv("MODEL_VISION", "qwen/qwen3-vl-32b-instruct")
 MODEL_FAST   = os.getenv("MODEL_FAST",   "deepseek/deepseek-v3.2")
 MAX_URLS     = int(os.getenv("RESEARCH_MAX_URLS", "3"))
-DDG_REGION   = os.getenv("RESEARCH_DDG_REGION", "de-de")
+SEARXNG_URL  = os.getenv("SEARXNG_URL", "http://searxng:8080")
 
 _HEADERS = {
     "Authorization": f"Bearer {API_KEY}",
@@ -52,10 +51,18 @@ def _track(model: str, usage: dict, sub_type: str) -> None:
     ))
 
 
-def _ddg_search(query: str, max_results: int) -> list[dict]:
-    """Synchronous DuckDuckGo search — run in thread to avoid blocking."""
-    with DDGS() as ddgs:
-        return list(ddgs.text(query, region=DDG_REGION, max_results=max_results))
+async def _searxng_search(query: str, max_results: int) -> list[dict]:
+    """Query self-hosted SearXNG JSON API. No API key, no rate limits."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
+            f"{SEARXNG_URL}/search",
+            params={"q": query, "format": "json", "language": "de",
+                    "max_results": max_results},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    return [{"href": r["url"], "body": r.get("content", "")}
+            for r in data.get("results", []) if r.get("url")]
 
 
 async def _fetch_source(url: str, snippet: str, query: str) -> tuple[str, str]:
@@ -163,13 +170,11 @@ async def handle(
     )
 
     # ── Step 1: DuckDuckGo search (free, no API key) ─────────
-    yield _sse("🔍 Searching DuckDuckGo...\n\n")
+    yield _sse("🔍 Searching...\n\n")
     try:
-        ddg_results: list[dict] = await asyncio.to_thread(
-            _ddg_search, user_text, MAX_URLS
-        )
+        ddg_results: list[dict] = await _searxng_search(user_text, MAX_URLS)
     except Exception as e:
-        log.warning("DDG search failed: %s", e)
+        log.warning("SearXNG search failed: %s", e)
         yield _sse(f"⚠️ Search error: {e}\n\n")
         yield _sse("", finish=True)
         yield b"data: [DONE]\n\n"

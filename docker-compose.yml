@@ -93,7 +93,7 @@ services:
       - MODEL_FALLBACK=${MODEL_FALLBACK:-google/gemini-3.1-flash-lite-preview}
       # Routing thresholds
       - RESEARCH_MAX_URLS=${RESEARCH_MAX_URLS:-3}
-      - RESEARCH_DDG_REGION=${RESEARCH_DDG_REGION:-de-de}
+      - SEARXNG_URL=http://searxng:8080
       - COMPLEXITY_THRESHOLD=${COMPLEXITY_THRESHOLD:-150}
       - CACHE_TTL=${CACHE_TTL:-3600}
       - RATE_LIMIT_RPM=${RATE_LIMIT_RPM:-60}
@@ -113,6 +113,8 @@ services:
         condition: service_healthy
       memory-svc:
         condition: service_healthy
+      searxng:
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 15s
@@ -197,6 +199,20 @@ services:
       start_period: 30s
     labels:
       - "com.openrouter.service=webui"
+
+  # ── SearXNG: Self-hosted Meta Search ──────────────────────
+  searxng:
+    <<: *common
+    image: searxng/searxng:latest
+    container_name: ai-searxng
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:${SEARXNG_PORT:-8090}/
+    volumes:
+      - /data/compose/openrouter-ai-stack/data/searxng:/etc/searxng
+    ports:
+      - "${SEARXNG_PORT:-8091}:8080"
+    labels:
+      - "com.openrouter.service=searxng"
 
 # ─── NETWORKS ────────────────────────────────────────────────
 
