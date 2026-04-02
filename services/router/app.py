@@ -29,7 +29,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from utils.cost_tracker import store_cost
+from utils.request_analyzer import detect_research_trigger, detect_imagegen_trigger, detect_audio_trigger
 from routes.cost_routes import router as cost_router
+from dispatchers import research_dispatcher
 
 # ─── Logging ─────────────────────────────────────────────────
 
@@ -465,6 +467,19 @@ async def chat_completions(request: Request, body: ChatRequest):
     # Rate limit by client IP
     client_ip = request.client.host if request.client else "unknown"
     await check_rate_limit(client_ip, redis)
+
+    # Check for special dispatchers first
+    user_text = _extract_text(body.messages)
+
+    if detect_research_trigger(user_text):
+        log.info("Dispatch: RESEARCH → %s", os.getenv("MODEL_SEARCH", "perplexity/sonar"))
+        msgs = [m.model_dump() for m in body.messages]
+        return StreamingResponse(
+            research_dispatcher.handle(msgs, body.stream, body.temperature, body.max_tokens),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                     "X-Model-Routed": "research"},
+        )
 
     # Select model via routing logic
     model = select_model(body)

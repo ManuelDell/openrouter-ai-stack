@@ -159,6 +159,13 @@ services:
       # Auth aktiviert → jeder braucht eigenen Account (Signup nur durch Admin)
       - WEBUI_AUTH=true
       - ENABLE_SIGNUP=false
+      # ── Authentik SSO (deaktiviert bis Authentik eingerichtet ist) ──
+      # OAUTH_CLIENT_ID=${AUTHENTIK_CLIENT_ID}
+      # OAUTH_CLIENT_SECRET=${AUTHENTIK_CLIENT_SECRET}
+      # OPENID_PROVIDER_URL=${AUTHENTIK_PROVIDER_URL}
+      # OAUTH_PROVIDER_NAME=Authentik
+      # ENABLE_OAUTH_SIGNUP=true
+      # OAUTH_MERGE_ACCOUNTS_BY_EMAIL=true
       # Standard-Modell: DeepSeek (günstig)
       - DEFAULT_MODELS=deepseek/deepseek-v3.2
       # UI Titel
