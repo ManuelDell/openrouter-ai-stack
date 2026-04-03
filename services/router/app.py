@@ -466,6 +466,28 @@ async def list_models():
     return {"object": "list", "data": models}
 
 
+@app.post("/v1/completions")
+async def legacy_completions(request: Request):
+    """
+    Legacy completions endpoint (FIM / tab-autocomplete).
+    Continue uses this for code autocomplete. Proxied directly to OpenRouter
+    using MODEL_FAST — no routing needed for short autocomplete snippets.
+    """
+    body = await request.json()
+    body.setdefault("model", MODEL_FAST)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{BASE_URL}/completions",
+            headers=_or_headers(),
+            json=body,
+        )
+        if resp.status_code == 404:
+            # OpenRouter may not support FIM for this model — fall back to empty
+            return JSONResponse({"choices": [{"text": "", "finish_reason": "stop"}]})
+        resp.raise_for_status()
+    return JSONResponse(resp.json())
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, body: ChatRequest):
     redis = await get_redis()
