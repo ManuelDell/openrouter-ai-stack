@@ -84,7 +84,7 @@ Cline sendet Request
 Router empfängt (Port 8085)
     ↓
 Routing-Entscheidung:
-  - Code-Review, Architektur, Refactoring  →  Qwen3-VL (komplex)
+  - Code-Review, Architektur, Refactoring  →  Qwen3-Coder Plus (komplex, 1M Kontext)
   - Bild im Kontext                        →  Qwen3-VL (vision)
   - Schnelle Fragen, kleine Änderungen     →  DeepSeek V3.2 (fast)
   - Fehler / Timeout                       →  Gemini Flash (fallback)
@@ -196,6 +196,27 @@ Neue Datei `.vscode/mcp.json` im Projektordner erstellen:
 | `analyze_image` | Bildanalyse via Qwen3-VL | Screenshot einfügen + Frage |
 | `search_memory` | Suche in vergangenen Sessions | *"Was haben wir letztes Mal besprochen?"* |
 | `route_info` | Routing-Entscheidung anzeigen | *"Welches Modell würde für X gewählt?"* |
+| `web_search` | Web-Suche via SearXNG — gezielt aufrufbar | *"Suche die aktuelle FastAPI-Doku"* |
+| `screenshot` | Webseite abrufen und Inhalt extrahieren | *"Lies diese URL und fasse sie zusammen"* |
+
+**`web_search` — explizit aufrufen, nie automatisch:**
+
+```
+web_search("FastAPI OAuth2 best practices")
+web_search("Qwen3 API changelog", max_results=3)
+```
+
+Gibt Titel, URL und Snippet zurück — ideal wenn die KI aktuelle Informationen braucht, ohne den gesamten Chat durch Auto-Trigger zu unterbrechen.
+
+**`screenshot` — Seiteninhalte extrahieren:**
+
+```
+screenshot("https://docs.example.com/api-reference")
+screenshot("https://dashboard.example.com", mode="screenshot")
+```
+
+- `mode=text` (Standard): extrahiert lesbaren Text aus der HTML-Seite
+- `mode=screenshot`: versucht Screenshot via Puppeteer (falls verfügbar), sonst Text
 
 ---
 
@@ -221,7 +242,8 @@ Deine Frage
 
 | Modell-ID | Wann sinnvoll |
 |-----------|---------------|
-| `qwen/qwen3-vl-32b-instruct` | Komplexe Code-Reviews erzwingen |
+| `qwen/qwen3-coder-plus` | Komplexe Coding-Aufgaben erzwingen (1M Token Kontext) |
+| `qwen/qwen3-vl-32b-instruct` | Vision-Tasks erzwingen |
 | `deepseek/deepseek-v3.2` | Kosten sparen bei einfachen Tasks |
 | `google/gemini-3.1-flash-lite-preview` | Fallback direkt nutzen |
 
@@ -247,8 +269,9 @@ curl http://DEINE-SERVER-IP:8085/api/costs/today
 curl http://DEINE-SERVER-IP:8085/api/costs/by_model
 ```
 
-**Forschungs-Modus**  
-Tippe `/research` oder `/recherchiere` in Cline/Continue um aktuelle Web-Informationen abzurufen (via SearXNG).
+**Forschungs-Modus (Chat)**  
+Tippe `/web`, `/search`, `/research` oder `/recherche` im Chat um aktuelle Web-Informationen abzurufen (via SearXNG).  
+Im VS Code Coder-Workflow lieber das `web_search` MCP-Tool verwenden — damit behält die KI den Code-Kontext und sucht nur wenn du es explizit anforderst.
 
 **Audio-Transkription**  
 Audiodateien direkt im Open WebUI hochladen → werden automatisch transkribiert (MiMo-V2-Omni via OpenRouter).

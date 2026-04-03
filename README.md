@@ -6,6 +6,15 @@ Ein produktionsreifer KI-Stack für selbst gehostete Infrastruktur — optimiert
 
 ---
 
+## Für wen ist was?
+
+| Ich bin... | Ich nutze... | Meine Anleitung |
+|-----------|-------------|-----------------|
+| Normaler Nutzer / Laie | **Open WebUI** im Browser | [OPENWEBUI_GUIDE.md](docs/OPENWEBUI_GUIDE.md) |
+| Entwickler / Coder | **VS Code** mit Cline + Continue | [VSCODE_SETUP.md](docs/VSCODE_SETUP.md) |
+
+---
+
 ## Auf einen Blick
 
 ```
@@ -34,13 +43,13 @@ VS Code (Cline / Continue)  ──────►  Smart Router :8085  ◄──
 
 | Feature | Status | Details |
 |---------|--------|---------|
-| **Smart Routing** | ✅ Aktiv | Automatisch: Vision → Qwen3-VL, Komplex → Qwen3-VL, Einfach → DeepSeek, Fehler → Gemini |
+| **Smart Routing** | ✅ Aktiv | Vision → Qwen3-VL, Komplex/Code → Qwen3-Coder Plus (1M Kontext), Einfach → DeepSeek, Fehler → Gemini |
 | **Memory System** | ✅ Aktiv | TF-IDF Ähnlichkeitssuche, SQLite, automatische Kontextinjizierung |
-| **Web Research** | ✅ Aktiv | Selbst gehostetes SearXNG + Seiteninhalte abrufen, Trigger: `/research` |
+| **Web Research** | ✅ Aktiv | SearXNG, Commands: `/web`, `/search`, `/recherche`, `/internet` |
 | **Audio Transkription** | ✅ Aktiv | MiMo-V2-Omni via OpenRouter, Groq Whisper als Fallback |
 | **Cost Tracking** | ✅ Aktiv | Jeder API-Call protokolliert, Abfrage via `/api/costs/*` |
-| **VS Code Integration** | ✅ Aktiv | Cline + Continue.dev, MCP Tools |
-| **Bildgenerierung** | ⏳ Vorbereitet | OpenRouter gibt Bilddaten in Responses noch nicht zurück (Stand April 2026) — [Details](#bekannte-einschränkungen) |
+| **VS Code Integration** | ✅ Aktiv | Cline + Continue.dev, MCP Tools: chat, complete_code, web_search, screenshot, ... |
+| **Bildgenerierung** | ✅ Aktiv (mit Key) | Together.ai FLUX.1-schnell-Free — `TOGETHER_API_KEY` in `.env` eintragen ([together.ai](https://api.together.ai), kostenlos) |
 | **Authentik SSO** | ⏳ Vorbereitet | OAuth2/OIDC-Config in docker-compose hinterlegt, nur auskommentiert |
 
 ---
@@ -107,7 +116,15 @@ Der erste registrierte Benutzer wird automatisch Admin. Weitere Accounts müssen
 
 ---
 
-## VS Code Integration
+## Für normale Nutzer — Open WebUI
+
+**`http://SERVER-IP:8088`** im Browser öffnen.
+
+→ **[Vollständige Anleitung: docs/OPENWEBUI_GUIDE.md](docs/OPENWEBUI_GUIDE.md)**
+
+---
+
+## Für Entwickler — VS Code Integration
 
 → **[Vollständige Anleitung: docs/VSCODE_SETUP.md](docs/VSCODE_SETUP.md)**
 
@@ -137,29 +154,35 @@ Der erste registrierte Benutzer wird automatisch Admin. Weitere Accounts müssen
 | Bedingung | Modell | Kosten (ca.) |
 |-----------|--------|-------------|
 | Bild im Request | `qwen/qwen3-vl-32b-instruct` | $0.20 / $0.88 per 1M |
-| ≥ 150 Wörter **oder** Komplex-Keyword | `qwen/qwen3-vl-32b-instruct` | $0.20 / $0.88 per 1M |
+| ≥ 150 Wörter **oder** Komplex-Keyword | `qwen/qwen3-coder-plus` (1M Kontext) | $0.65 / $3.50 per 1M |
 | Einfache / kurze Anfrage | `deepseek/deepseek-v3.2` | $0.14 / $0.28 per 1M |
 | Fehler / Timeout | `google/gemini-3.1-flash-lite-preview` | sehr günstig |
 
 **Komplex-Keywords** (konfigurierbar via `COMPLEX_KEYWORDS` in `.env`):  
 `analyze`, `explain`, `debug`, `refactor`, `optimize`, `design`, `architecture`, `review` + deutsche Entsprechungen
 
-**Manuelle Overrides:** Ein bekanntes Modell explizit angeben überschreibt das Routing. `auto` oder unbekannte Namen → automatisches Routing.
+**Manuelle Overrides:** Ein bekanntes Modell explizit angeben überschreibt das Routing. Unbekannte Namen → automatisches Routing.
 
 ---
 
 ## Special Commands
 
-Direkt im Chat (Web oder VS Code) verwendbar:
+Direkt im Chat (Open WebUI oder VS Code) verwendbar:
 
-| Command | Funktion |
-|---------|---------|
-| `/research <frage>` | Web-Recherche via SearXNG |
-| `/recherchiere <frage>` | Web-Recherche (Deutsch) |
-| `/transkribiere` | Audio-Transkription (sichtbar) |
-| `/transcribe` | Audio-Transkription (Englisch) |
+| Command | Varianten | Funktion |
+|---------|-----------|---------|
+| `/web <frage>` | `/search`, `/internet`, `/suche` | Web-Recherche via SearXNG |
+| `/recherche <frage>` | `/recherchiere`, `/research` | Web-Recherche (Deutsch) |
+| `/transkribiere` | `/transcribe` | Audio-Transkription (sichtbar) |
 
-Natürliche Sprache wird ebenfalls erkannt — z.B. *"Was sind die neuesten Meldungen zu..."* löst die Recherche aus.
+Natürliche Phrasen lösen die Recherche ebenfalls aus: *"suche im internet"*, *"google mal"*, *"search the web"* usw.
+
+**Nur im VS Code / Coder-Bereich (MCP Tools — kein Auto-Trigger):**
+
+| Tool | Funktion |
+|------|---------|
+| `web_search(query)` | Gezielt Web-Suche ohne Chat-Unterbrechung |
+| `screenshot(url)` | Seiteninhalte lesen / extrahieren |
 
 ---
 
@@ -228,7 +251,8 @@ openrouter-ai-stack/
 ├── .env.example                    # Konfigurations-Template
 ├── .env                            # Deine Config (nicht committen!)
 ├── docs/
-│   └── VSCODE_SETUP.md             # VS Code Einrichtungsanleitung
+│   ├── OPENWEBUI_GUIDE.md          # Benutzerhandbuch (Laien / alle Nutzer)
+│   └── VSCODE_SETUP.md             # VS Code Einrichtungsanleitung (Entwickler)
 ├── services/
 │   ├── router/                     # Smart Router (FastAPI)
 │   │   ├── app.py
@@ -279,11 +303,23 @@ docker compose down -v
 
 ---
 
-## Bekannte Einschränkungen
+## Bildgenerierung aktivieren
 
-**Bildgenerierung**  
-Der `/imagegen` Dispatcher ist implementiert und kann ausgelöst werden, gibt aber eine Hinweismeldung zurück statt ein Bild zu generieren. Grund: OpenRouter gibt Bilddaten (trotz korrekter Generierung und Berechnung von Image-Tokens) nicht in der API-Antwort zurück — Stand April 2026. Es werden dabei **keine Kosten** verursacht.  
-*Workaround:* Im Open WebUI unter *Admin Panel → Settings → Images* einen DALL-E API-Key hinterlegen.
+Bildgenerierung nutzt **Together.ai FLUX.1-schnell-Free** (kostenlos im Free-Tier):
+
+1. Kostenlosen Account erstellen: [api.together.ai](https://api.together.ai)
+2. API-Key kopieren
+3. In `.env` eintragen:
+   ```env
+   TOGETHER_API_KEY=dein-key-hier
+   ```
+4. Router neu starten: `docker compose restart ai-router`
+
+Sobald der Key gesetzt ist, können Nutzer Bilder per Chat-Befehl generieren:
+```
+Zeichne einen Hund auf einer Wiese
+Generiere ein Bild von einem futuristischen Stadtbild
+```
 
 ---
 

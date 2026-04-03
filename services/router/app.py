@@ -457,12 +457,14 @@ async def health():
 @app.get("/v1/models")
 async def list_models():
     """Return available models in OpenAI-compatible format."""
-    models = [
-        {"id": "auto",         "object": "model", "owned_by": "openrouter", "role": "auto-routing"},
-        {"id": MODEL_VISION,   "object": "model", "owned_by": "openrouter", "role": "vision+complex"},
+    seen: set[str] = set()
+    entries = [
+        {"id": MODEL_VISION,   "object": "model", "owned_by": "openrouter", "role": "vision"},
+        {"id": MODEL_COMPLEX,  "object": "model", "owned_by": "openrouter", "role": "complex"},
         {"id": MODEL_FAST,     "object": "model", "owned_by": "openrouter", "role": "fast"},
         {"id": MODEL_FALLBACK, "object": "model", "owned_by": "openrouter", "role": "fallback"},
     ]
+    models = [e for e in entries if not (e["id"] in seen or seen.add(e["id"]))]
     return {"object": "list", "data": models}
 
 
@@ -596,6 +598,22 @@ async def route_info(body: ChatRequest):
         "word_count":      len(text.split()),
         "threshold":       COMPLEXITY_THRESHOLD,
     }
+
+
+@app.get("/v1/fetch")
+async def fetch_page(url: str, mode: str = "text"):
+    """
+    Fetch page content for MCP tools.
+    mode=text       → extract readable text from HTML
+    mode=screenshot → screenshot (base64 JPEG) if Puppeteer available, else text
+    """
+    from utils.content_fetcher import fetch_or_screenshot, fetch_text
+    if mode == "screenshot":
+        content, is_visual = await fetch_or_screenshot(url)
+    else:
+        content = await fetch_text(url) or f"[Could not fetch {url}]"
+        is_visual = False
+    return {"url": url, "content": content, "is_visual": is_visual}
 
 
 def _audio_mime(filename: str, content_type: Optional[str]) -> str:

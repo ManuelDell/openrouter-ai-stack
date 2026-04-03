@@ -10,15 +10,22 @@ from typing import Optional
 
 # ── Research triggers ─────────────────────────────────────────
 
-RESEARCH_COMMANDS = {"/recherchiere", "/research", "/search", "/suche"}
+RESEARCH_COMMANDS = {
+    "/recherche", "/recherchiere",   # Deutsch
+    "/research", "/search", "/web",  # Englisch / kurz
+    "/suche", "/internet",           # Alternativ
+}
 
 RESEARCH_KEYWORDS = {
-    # German — only explicit news/research intent
+    # German — explicit web/news/research intent
     "nachrichten", "aktueller stand", "breaking news",
     "was ist passiert", "neueste meldungen",
-    # English — only explicit news/research intent
-    "breaking news", "what happened", "latest news",
+    "suche im internet", "suche online",
+    "was steht im netz", "google mal",
+    # English — explicit web/news/research intent
+    "what happened", "latest news",
     "what's new", "whats new",
+    "search the web", "search online",
 }
 
 URL_PATTERN = re.compile(r"https?://\S+")

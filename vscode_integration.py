@@ -37,10 +37,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-ROUTER_URL = os.getenv("ROUTER_URL", "http://localhost:8085")
-MEMORY_URL = os.getenv("MEMORY_URL", "http://localhost:8086")
-MCP_SECRET = os.getenv("MCP_SECRET", "")
-MCP_PORT   = int(os.getenv("MCP_PORT", "8087"))
+ROUTER_URL   = os.getenv("ROUTER_URL", "http://localhost:8085")
+MEMORY_URL   = os.getenv("MEMORY_URL", "http://localhost:8086")
+SEARXNG_URL  = os.getenv("SEARXNG_URL", "http://searxng:8080")
+MCP_SECRET   = os.getenv("MCP_SECRET", "")
+MCP_PORT     = int(os.getenv("MCP_PORT", "8087"))
 
 # ─── MCP Tool Definitions ────────────────────────────────────
 
@@ -126,6 +127,30 @@ TOOLS = [
                 "message": {"type": "string", "description": "The message to analyze"},
             },
             "required": ["message"],
+        },
+    },
+    {
+        "name":        "web_search",
+        "description": "Search the web via self-hosted SearXNG. Returns titles, URLs and snippets.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query":       {"type": "string",  "description": "Search query"},
+                "max_results": {"type": "integer", "description": "Max results to return (default: 5)", "default": 5},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name":        "screenshot",
+        "description": "Fetch a webpage and return its content as text (or screenshot base64 for visual pages).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url":  {"type": "string", "description": "URL of the page to fetch"},
+                "mode": {"type": "string", "enum": ["text", "screenshot"], "description": "text=extract readable text, screenshot=capture visual pages", "default": "text"},
+            },
+            "required": ["url"],
         },
     },
 ]
@@ -314,12 +339,68 @@ async def handle_route_info(args: dict) -> dict:
     return {"type": "text", "text": text}
 
 
+async def handle_web_search(args: dict) -> dict:
+    query       = args["query"]
+    max_results = int(args.get("max_results", 5))
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
+            f"{SEARXNG_URL}/search",
+            params={"q": query, "format": "json", "categories": "general"},
+        )
+        if resp.status_code != 200:
+            return {"type": "text", "text": f"SearXNG unavailable (HTTP {resp.status_code})"}
+        data = resp.json()
+
+    results = data.get("results", [])[:max_results]
+    if not results:
+        return {"type": "text", "text": f"No results found for: {query}"}
+
+    lines = [f"Web search results for: **{query}**\n"]
+    for i, r in enumerate(results, 1):
+        lines.append(f"{i}. **{r.get('title', 'No title')}**")
+        lines.append(f"   {r.get('url', '')}")
+        if snippet := r.get("content", ""):
+            lines.append(f"   {snippet[:200]}")
+        lines.append("")
+    return {"type": "text", "text": "\n".join(lines)}
+
+
+async def handle_screenshot(args: dict) -> dict:
+    url  = args["url"]
+    mode = args.get("mode", "text")
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.get(
+            f"{ROUTER_URL}/v1/fetch",
+            params={"url": url, "mode": mode},
+        )
+        if resp.status_code != 200:
+            return {"type": "text", "text": f"Could not fetch {url} (HTTP {resp.status_code})"}
+        data = resp.json()
+
+    content    = data.get("content", "")
+    is_visual  = data.get("is_visual", False)
+
+    if is_visual and mode == "screenshot":
+        return {
+            "type": "text",
+            "text": (
+                f"Screenshot of {url} (base64 JPEG):\n"
+                f"data:image/jpeg;base64,{content}"
+            ),
+        }
+    return {"type": "text", "text": f"Content of {url}:\n\n{content}"}
+
+
 TOOL_HANDLERS = {
     "chat":           handle_chat,
     "complete_code":  handle_complete_code,
     "analyze_image":  handle_analyze_image,
     "search_memory":  handle_search_memory,
     "route_info":     handle_route_info,
+    "web_search":     handle_web_search,
+    "screenshot":     handle_screenshot,
 }
 
 # ─── MCP HTTP Endpoints ──────────────────────────────────────

@@ -91,7 +91,8 @@ services:
       - MODEL_COMPLEX=${MODEL_COMPLEX:-qwen/qwen3-vl}
       - MODEL_FAST=${MODEL_FAST:-deepseek/deepseek-v3.2}
       - MODEL_FALLBACK=${MODEL_FALLBACK:-google/gemini-3.1-flash-lite-preview}
-      - MODEL_IMAGEGEN=${MODEL_IMAGEGEN:-google/gemini-2.5-flash-image}
+      - MODEL_IMAGEGEN=${MODEL_IMAGEGEN:-black-forest-labs/FLUX.1-schnell-Free}
+      - TOGETHER_API_KEY=${TOGETHER_API_KEY}
       # Routing thresholds
       - RESEARCH_MAX_URLS=${RESEARCH_MAX_URLS:-3}
       - SEARXNG_URL=http://searxng:8080
@@ -134,6 +135,7 @@ services:
     environment:
       - ROUTER_URL=http://ai-router:8080
       - MEMORY_URL=http://memory-svc:8081
+      - SEARXNG_URL=http://searxng:8080
       - MCP_PORT=8082
       - MCP_SECRET=${MCP_SECRET}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
