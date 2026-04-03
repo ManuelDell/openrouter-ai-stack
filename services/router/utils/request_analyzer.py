@@ -25,13 +25,15 @@ URL_PATTERN = re.compile(r"https?://\S+")
 
 
 def detect_research_trigger(text: str) -> bool:
-    """Return True if the message should be routed to the research dispatcher."""
+    """
+    Return True if the message should be routed to the research dispatcher.
+    URL presence alone does NOT trigger research — code files contain URLs
+    (e.g. http://www.w3.org/2000/svg) and would cause false positives.
+    Only explicit commands and specific news phrases trigger research.
+    """
     lower = text.lower()
 
     if any(cmd in lower for cmd in RESEARCH_COMMANDS):
-        return True
-
-    if URL_PATTERN.search(text):
         return True
 
     words = set(lower.split())
