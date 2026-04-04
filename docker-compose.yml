@@ -106,6 +106,8 @@ services:
       - MEMORY_SERVICE_URL=http://memory-svc:8081
       - BASH_EXECUTOR_URL=http://bash-executor:8090
       - WEBUI_INTERNAL_URL=http://open-webui:8080
+      - WEBUI_API_KEY=${WEBUI_API_KEY}
+      - WEBUI_EXTERNAL_URL=${WEBUI_URL:-http://localhost:8088}
       # Model configuration
       - MODEL_VISION=${MODEL_VISION:-qwen/qwen3-vl}
       - MODEL_COMPLEX=${MODEL_COMPLEX:-qwen/qwen3-vl}
@@ -113,6 +115,7 @@ services:
       - MODEL_FALLBACK=${MODEL_FALLBACK:-google/gemini-3.1-flash-lite-preview}
       - MODEL_IMAGEGEN=${MODEL_IMAGEGEN:-black-forest-labs/FLUX.1-schnell}
       - TOGETHER_API_KEY=${TOGETHER_API_KEY}
+      - ROUTER_EXTERNAL_URL=${ROUTER_EXTERNAL_URL:-http://localhost:8085}
       # Routing thresholds
       - RESEARCH_MAX_URLS=${RESEARCH_MAX_URLS:-3}
       - SEARXNG_URL=http://searxng:8080

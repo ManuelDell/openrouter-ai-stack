@@ -413,6 +413,24 @@ async def stream_openrouter(
         ) as resp:
             resp.raise_for_status()
             async for chunk in resp.aiter_bytes():
+                # OpenRouter sometimes sends HTTP 200 but injects a JSON error
+                # into the SSE stream (e.g. rate_limit_exceeded as code 429).
+                # Detect before yielding so stream_with_fallback can fall back.
+                text = chunk.decode(errors="ignore")
+                if '"error_type"' in text:
+                    code = 500
+                    try:
+                        for line in text.split("\n"):
+                            line = line.strip()
+                            if line.startswith("data: "):
+                                line = line[6:]
+                            if line.startswith("{"):
+                                err = json.loads(line)
+                                code = err.get("code") or err.get("details", {}).get("code", 500)
+                                break
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"OpenRouter in-stream error (code={code})")
                 yield chunk
 
 
@@ -482,6 +500,11 @@ async def stream_with_fallback(
                 async for chunk in stream_openrouter(attempt_model, messages, temperature, max_tokens, tools=None):
                     yield chunk
                 return
+            raise
+        except RuntimeError as e:
+            if attempt_model != last:
+                log.warning("Stream fallback: %s → next (%s)", attempt_model, e)
+                continue
             raise
         except Exception:
             if attempt_model != last:
@@ -745,7 +768,7 @@ async def _stream_with_tool_loop(
         if not is_tool:
             # Text response was fully streamed — fire-and-forget memory + cost + usage
             asyncio.create_task(store_interaction(msgs, "".join(full_text), user_id))
-            asyncio.create_task(increment_usage(model, redis))
+            asyncio.create_task(increment_usage(model, _redis))
             if usage:
                 asyncio.create_task(asyncio.to_thread(
                     store_cost, model,
@@ -822,9 +845,11 @@ async def _stream_with_tool_loop(
         if only_image:
             url = tool_results[tool_calls[0]["id"]]
             if url.startswith("http"):
-                yield _sse_chunk(f"![Generiertes Bild]({url})\n")
+                yield _sse_chunk(f"Das generierte Bild:\n\n![Generiertes Bild]({url})\n")
             else:
                 yield _sse_chunk(url)  # error message
+            # Send finish_reason: stop so OWT flushes and renders the last chunk
+            yield b'data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}]}\n\n'
             yield b"data: [DONE]\n\n"
             return
 
@@ -889,6 +914,37 @@ async def legacy_completions(request: Request):
             return JSONResponse({"choices": [{"text": "", "finish_reason": "stop"}]})
         resp.raise_for_status()
     return JSONResponse(resp.json())
+
+
+@app.post("/v1/images/generations")
+async def image_generations(request: Request):
+    """
+    OpenAI-compatible image generation endpoint for OWT's native image gen.
+    Returns b64_json so OWT can store the image itself (no mixed-content issues).
+    """
+    TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY", "")
+    if not TOGETHER_API_KEY:
+        raise HTTPException(status_code=503, detail="Image generation not configured (TOGETHER_API_KEY missing)")
+
+    body = await request.json()
+    prompt = body.get("prompt", "")
+    n      = body.get("n", 1)
+    size   = body.get("size", "1024x1024")
+    width, height = (int(x) for x in size.split("x")) if "x" in size else (1024, 1024)
+    model  = os.getenv("MODEL_IMAGEGEN", "black-forest-labs/FLUX.1-schnell")
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            "https://api.together.xyz/v1/images/generations",
+            headers={"Authorization": f"Bearer {TOGETHER_API_KEY}", "Content-Type": "application/json"},
+            json={"model": model, "prompt": prompt, "n": n,
+                  "width": width, "height": height, "response_format": "b64_json"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    log.info("ImageGen (native): prompt='%s...' → %d image(s)", prompt[:60], len(data.get("data", [])))
+    return JSONResponse({"created": int(time.time()), "data": data.get("data", [])})
 
 
 @app.post("/v1/chat/completions")

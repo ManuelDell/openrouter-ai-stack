@@ -6,6 +6,7 @@ No SSE, no streaming — pure request/response.
 """
 
 import asyncio
+import base64
 import logging
 import os
 from typing import Any
@@ -16,52 +17,73 @@ from utils.content_fetcher import fetch_or_screenshot
 
 log = logging.getLogger("tool_executor")
 
-TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY", "")
-TOGETHER_IMG_URL = "https://api.together.xyz/v1/images/generations"
-MODEL_IMAGEGEN   = os.getenv("MODEL_IMAGEGEN", "black-forest-labs/FLUX.1-schnell")
-IMG_WIDTH        = int(os.getenv("IMAGEGEN_WIDTH", "1024"))
-IMG_HEIGHT       = int(os.getenv("IMAGEGEN_HEIGHT", "1024"))
+TOGETHER_API_KEY  = os.getenv("TOGETHER_API_KEY", "")
+TOGETHER_IMG_URL  = "https://api.together.xyz/v1/images/generations"
+MODEL_IMAGEGEN    = os.getenv("MODEL_IMAGEGEN", "black-forest-labs/FLUX.1-schnell")
+IMG_WIDTH         = int(os.getenv("IMAGEGEN_WIDTH", "1024"))
+IMG_HEIGHT        = int(os.getenv("IMAGEGEN_HEIGHT", "1024"))
 
-SEARXNG_URL      = os.getenv("SEARXNG_URL", "http://searxng:8080")
-MAX_URLS         = int(os.getenv("RESEARCH_MAX_URLS", "3"))
+# OWT connection — images are uploaded to OWT's own storage so the browser
+# can fetch them at the same HTTPS origin without mixed-content issues.
+WEBUI_INTERNAL_URL = os.getenv("WEBUI_INTERNAL_URL", "http://open-webui:8080")
+WEBUI_API_KEY      = os.getenv("WEBUI_API_KEY", "")
+WEBUI_EXTERNAL_URL = os.getenv("WEBUI_EXTERNAL_URL", "http://localhost:8088")
 
+SEARXNG_URL       = os.getenv("SEARXNG_URL", "http://searxng:8080")
+MAX_URLS          = int(os.getenv("RESEARCH_MAX_URLS", "3"))
 BASH_EXECUTOR_URL = os.getenv("BASH_EXECUTOR_URL", "http://bash-executor:8090")
 
 
 # ── Image Generation ──────────────────────────────────────────
 
-async def _expand_url(url: str) -> str:
-    """Follow redirects to get the final CDN URL (Together.ai returns short URLs)."""
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
-            resp = await client.head(url)
-            return str(resp.url)
-    except Exception:
-        return url
+_PROMPT_SUFFIX = ", high quality, detailed illustration, safe for work, no NSFW"
+_BLACK_IMAGE_MAX_BYTES = 15_000  # Together.ai returns tiny JPEGs when safety filter blocks
 
 
 async def _tool_generate_image(prompt: str) -> str:
     if not TOGETHER_API_KEY:
         return "Image generation is not configured (TOGETHER_API_KEY missing)."
+    if not WEBUI_API_KEY:
+        return "Image upload is not configured (WEBUI_API_KEY missing)."
+
+    # Enrich short/vague prompts to reduce safety-filter rejections
+    enriched = prompt if prompt.endswith(_PROMPT_SUFFIX) else prompt + _PROMPT_SUFFIX
 
     async with httpx.AsyncClient(timeout=60.0) as client:
+        # 1. Generate image via Together.ai (b64_json avoids CDN issues)
         resp = await client.post(
             TOGETHER_IMG_URL,
             headers={"Authorization": f"Bearer {TOGETHER_API_KEY}", "Content-Type": "application/json"},
-            json={"model": MODEL_IMAGEGEN, "prompt": prompt, "n": 1,
-                  "width": IMG_WIDTH, "height": IMG_HEIGHT},
+            json={"model": MODEL_IMAGEGEN, "prompt": enriched, "n": 1,
+                  "width": IMG_WIDTH, "height": IMG_HEIGHT, "response_format": "b64_json"},
         )
         resp.raise_for_status()
-        data = resp.json()
+        b64_data = resp.json()["data"][0].get("b64_json", "")
+        if not b64_data:
+            return resp.json()["data"][0].get("url", "Image generation failed: no data.")
 
-    image_url = data["data"][0].get("url", "")
-    if not image_url:
-        return "Image generation failed: no URL in response."
+        img_bytes = base64.b64decode(b64_data)
 
-    # Expand short URLs so browsers can render the image directly
-    image_url = await _expand_url(image_url)
-    log.info("Tool generate_image → %s", image_url[:80])
-    return image_url  # Return bare URL — router will embed as markdown
+        # 2. Detect safety-filter black image (solid-black JPEGs are very small)
+        if len(img_bytes) < _BLACK_IMAGE_MAX_BYTES:
+            log.warning("generate_image: safety filter likely triggered (%d bytes) for prompt: %r",
+                        len(img_bytes), prompt[:80])
+            return ("Image generation was blocked by the safety filter. "
+                    "Please use a more detailed, clearly non-NSFW description.")
+
+        # 3. Upload to OWT's own file storage (internal Docker network)
+        upload = await client.post(
+            f"{WEBUI_INTERNAL_URL}/api/v1/files/",
+            headers={"Authorization": f"Bearer {WEBUI_API_KEY}"},
+            files={"file": ("generated-image.jpg", img_bytes, "image/jpeg")},
+        )
+        upload.raise_for_status()
+        file_id = upload.json()["id"]
+
+    # 4. Return the OWT-served URL (same HTTPS origin as OWT — no mixed content)
+    url = f"{WEBUI_EXTERNAL_URL}/api/v1/files/{file_id}/content"
+    log.info("Tool generate_image → OWT file %s (%d bytes)", file_id[:8], len(img_bytes))
+    return url
 
 
 # ── Web Search ────────────────────────────────────────────────
