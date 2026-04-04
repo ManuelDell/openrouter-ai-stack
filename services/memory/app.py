@@ -40,9 +40,10 @@ SIM_THRESH = float(os.getenv("SIMILARITY_THRESHOLD", "0.3"))
 
 # ─── SQLite Schema ───────────────────────────────────────────
 
-SCHEMA = """
+_SCHEMA_BASE = """
 CREATE TABLE IF NOT EXISTS memories (
     id         TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL DEFAULT 'default',
     query      TEXT NOT NULL,
     response   TEXT NOT NULL,
     tokens     TEXT NOT NULL,  -- JSON: word frequency map
@@ -56,7 +57,18 @@ def get_db() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
+    conn.executescript(_SCHEMA_BASE)  # table + created_at index only
+
+    # ── migration: add user_id column if DB was created before this change ──
+    try:
+        conn.execute("ALTER TABLE memories ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default'")
+        conn.commit()
+        log.info("Migrated memories table: added user_id column")
+    except Exception:
+        pass  # column already exists
+
+    # ── create user_id index after column is guaranteed to exist ──
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_user ON memories(user_id)")
     conn.commit()
     return conn
 
@@ -106,11 +118,13 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 class StoreRequest(BaseModel):
     query:    str
     response: str
+    user_id:  str = "default"
     metadata: Optional[dict] = None
 
 class SearchRequest(BaseModel):
-    query: str
-    limit: int = 5
+    query:   str
+    limit:   int = 5
+    user_id: str = "default"
 
 # ─── Routes ──────────────────────────────────────────────────
 
@@ -121,14 +135,21 @@ def health():
 @app.get("/stats")
 def stats():
     with get_db() as conn:
-        count = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        count  = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
         oldest = conn.execute("SELECT MIN(created_at) FROM memories").fetchone()[0]
         newest = conn.execute("SELECT MAX(created_at) FROM memories").fetchone()[0]
+        by_user = [
+            {"user_id": r["user_id"], "count": r["count"]}
+            for r in conn.execute(
+                "SELECT user_id, COUNT(*) as count FROM memories GROUP BY user_id ORDER BY count DESC"
+            ).fetchall()
+        ]
     return {
         "total":   count,
         "max":     MAX_MEM,
         "oldest":  oldest,
         "newest":  newest,
+        "by_user": by_user,
         "db_path": DB_PATH,
     }
 
@@ -139,7 +160,7 @@ def store(req: StoreRequest):
     meta  = json.dumps(req.metadata or {"timestamp": time.time()})
 
     with get_db() as conn:
-        # Enforce max memories: evict oldest
+        # Enforce max memories globally: evict oldest
         count = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
         if count >= MAX_MEM:
             oldest = conn.execute(
@@ -150,12 +171,12 @@ def store(req: StoreRequest):
                 conn.execute("DELETE FROM memories WHERE id = ?", (row["id"],))
 
         conn.execute(
-            "INSERT INTO memories(id,query,response,tokens,metadata,created_at) VALUES(?,?,?,?,?,?)",
-            (mid, req.query[:2000], req.response[:4000], toks, meta, time.time()),
+            "INSERT INTO memories(id,user_id,query,response,tokens,metadata,created_at) VALUES(?,?,?,?,?,?,?)",
+            (mid, req.user_id, req.query[:2000], req.response[:4000], toks, meta, time.time()),
         )
         conn.commit()
 
-    log.debug("Stored memory id=%s", mid)
+    log.debug("Stored memory id=%s user=%s", mid, req.user_id)
     return {"id": mid, "status": "stored"}
 
 @app.post("/search")
@@ -165,7 +186,8 @@ def search(req: SearchRequest):
 
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT id,query,response,tokens,metadata FROM memories"
+            "SELECT id,query,response,tokens,metadata FROM memories WHERE user_id = ?",
+            (req.user_id,),
         ).fetchall()
 
     scored: list[dict] = []
@@ -197,9 +219,16 @@ def delete_one(memory_id: str):
     return {"status": "deleted", "id": memory_id}
 
 @app.delete("/memories")
-def delete_all():
+def delete_all(user_id: Optional[str] = None):
+    """Delete all memories. Scoped to user_id if provided, otherwise all (admin)."""
     with get_db() as conn:
-        count = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-        conn.execute("DELETE FROM memories")
+        if user_id:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE user_id = ?", (user_id,)
+            ).fetchone()[0]
+            conn.execute("DELETE FROM memories WHERE user_id = ?", (user_id,))
+        else:
+            count = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+            conn.execute("DELETE FROM memories")
         conn.commit()
-    return {"status": "cleared", "deleted": count}
+    return {"status": "cleared", "deleted": count, "user_id": user_id or "all"}

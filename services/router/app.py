@@ -29,9 +29,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from utils.cost_tracker import store_cost
-from utils.request_analyzer import detect_research_trigger, detect_imagegen_trigger, detect_audio_trigger
 from routes.cost_routes import router as cost_router
-from dispatchers import research_dispatcher, audio_dispatcher, imagegen_dispatcher
+from tools.definitions import TOOL_DEFINITIONS
+from tools.executor import execute_tool
+from models.class_router import ALIASES, CODING_CLASSES, resolve_class_chain, increment_usage, get_class_status
 
 # ─── Logging ─────────────────────────────────────────────────
 
@@ -58,6 +59,9 @@ CACHE_TTL            = int(os.getenv("CACHE_TTL", "3600"))
 RATE_LIMIT_RPM       = int(os.getenv("RATE_LIMIT_RPM", "60"))
 HTTP_REFERER         = os.getenv("HTTP_REFERER", "http://localhost:8080")
 X_TITLE              = os.getenv("X_TITLE", "OpenRouter AI Stack")
+
+WEBUI_INTERNAL_URL = os.getenv("WEBUI_INTERNAL_URL", "http://open-webui:8080")
+MASTER_API_KEY     = os.getenv("MASTER_API_KEY", "openrouter-via-proxy")
 
 COMPLEX_KEYWORDS = set(
     os.getenv(
@@ -113,6 +117,7 @@ class ChatRequest(BaseModel):
     max_tokens: Optional[int] = None
     use_memory: bool = True               # inject relevant memories
     metadata: Optional[dict] = None
+    tools: Optional[list] = None          # client-provided tools (e.g. Continue agent)
 
 # ─── Routing Logic ───────────────────────────────────────────
 
@@ -196,6 +201,23 @@ def select_model(request: ChatRequest) -> str:
     return MODEL_FAST
 
 
+async def resolve_model(
+    request: "ChatRequest", redis, need_tools: bool = False
+) -> tuple[str, list[str]]:
+    """
+    Returns (primary_model, fallback_chain).
+    For class aliases: full tier chain (free → paid), no global fallback mixed in.
+    For heuristic routing: empty chain (stream_with_fallback adds MODEL_FALLBACK).
+    """
+    if request.model:
+        class_name = ALIASES.get(request.model.lower())
+        if class_name:
+            chain = await resolve_class_chain(class_name, redis, need_tools)
+            log.info("Route: CLASS %s → chain=%s", class_name, chain)
+            return chain[0], chain[1:]
+    return select_model(request), []
+
+
 # ─── Cache ───────────────────────────────────────────────────
 
 def _cache_key(model: str, messages: list[Message]) -> str:
@@ -224,9 +246,73 @@ async def check_rate_limit(client_ip: str, redis: aioredis.Redis) -> None:
     if count > RATE_LIMIT_RPM:
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
+# ─── User Identity ───────────────────────────────────────────
+
+async def _resolve_user_id(
+    api_key: str,
+    headers: dict,
+    redis: aioredis.Redis,
+) -> str:
+    """
+    Resolve user identity from the request.
+
+    Priority:
+    1. Master key + OWT-forwarded header → trust OWT's user email directly.
+    2. Non-master key → validate against OWT's API (cached 5 min in Redis).
+    3. Fallback → "default".
+
+    Security: Forwarded OWT headers are only trusted with the master key because
+    only OWT (which already authenticated the user) sends that key+header combo.
+    A direct caller with a non-master key must prove identity via OWT API validation.
+    """
+    if api_key == MASTER_API_KEY:
+        email = headers.get("x-openwebui-user-email")
+        if email:
+            return email
+        return "default"
+
+    if not api_key:
+        return "default"
+
+    key_hash  = hashlib.sha256(api_key.encode()).hexdigest()
+    cache_key = f"user_key:{key_hash}"
+    cached    = await redis.get(cache_key)
+    if cached:
+        return cached
+
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.get(
+                f"{WEBUI_INTERNAL_URL}/api/v1/users/user/info",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except Exception as je:
+                    log.warning("OWT user/info: 200 OK but JSON parse failed: %s | body: %s", je, resp.text[:200])
+                    return "default"
+                if not isinstance(data, dict):
+                    log.warning("OWT user/info: expected dict, got %s | body: %s", type(data).__name__, resp.text[:200])
+                    return "default"
+                log.info("OWT user/info response keys: %s | data: %s", list(data.keys()), str(data)[:200])
+                user_id = data.get("email") or data.get("id") or "default"
+                await redis.setex(cache_key, 300, user_id)
+                log.info("Resolved API key → user=%s (cached 5 min)", user_id)
+                return user_id
+            else:
+                log.warning("OWT user/info returned HTTP %d: %s", resp.status_code, resp.text[:200])
+    except Exception as e:
+        log.warning("OWT key validation failed: %s", e)
+
+    return "default"
+
+
 # ─── Memory Injection ────────────────────────────────────────
 
-async def inject_memories(messages: list[Message], query: str) -> list[Message]:
+async def inject_memories(
+    messages: list[Message], query: str, user_id: str = "default"
+) -> list[Message]:
     """
     Retrieve relevant memories from memory-svc and prepend
     a system context message if any are found.
@@ -235,7 +321,7 @@ async def inject_memories(messages: list[Message], query: str) -> list[Message]:
         async with httpx.AsyncClient(timeout=3.0) as client:
             resp = await client.post(
                 f"{MEMORY_URL}/search",
-                json={"query": query, "limit": 5},
+                json={"query": query, "limit": 5, "user_id": user_id},
             )
             if resp.status_code == 200:
                 memories = resp.json().get("memories", [])
@@ -265,32 +351,36 @@ def _or_headers() -> dict:
 
 def _build_payload(
     model: str,
-    messages: list[Message],
+    messages: list,  # list[Message] or list[dict]
     temperature: Optional[float],
     max_tokens: Optional[int],
     stream: bool,
+    tools: Optional[list] = None,
 ) -> dict:
-    payload: dict = {
-        "model":    model,
-        "messages": [m.model_dump(exclude_none=True) for m in messages],
-        "stream":   stream,
-    }
+    serialized = [
+        m if isinstance(m, dict) else m.model_dump(exclude_none=True)
+        for m in messages
+    ]
+    payload: dict = {"model": model, "messages": serialized, "stream": stream}
     if temperature is not None:
         payload["temperature"] = temperature
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
+    if tools:
+        payload["tools"] = tools
     return payload
 
 
 async def call_openrouter(
     model: str,
-    messages: list[Message],
+    messages: list,
     temperature: Optional[float],
     max_tokens: Optional[int],
+    tools: Optional[list] = None,
 ) -> dict:
     """Non-streaming call. Returns parsed JSON dict."""
-    payload = _build_payload(model, messages, temperature, max_tokens, stream=False)
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    payload = _build_payload(model, messages, temperature, max_tokens, stream=False, tools=tools)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)) as client:
         resp = await client.post(
             f"{BASE_URL}/chat/completions",
             headers=_or_headers(),
@@ -302,18 +392,19 @@ async def call_openrouter(
 
 async def stream_openrouter(
     model: str,
-    messages: list[Message],
+    messages: list,
     temperature: Optional[float],
     max_tokens: Optional[int],
+    tools: Optional[list] = None,
 ) -> AsyncGenerator[bytes, None]:
     """
     Streaming call — keeps the httpx client alive for the full stream.
     Client is only closed after the last byte is yielded.
     """
-    payload = _build_payload(model, messages, temperature, max_tokens, stream=True)
+    payload = _build_payload(model, messages, temperature, max_tokens, stream=True, tools=tools)
     # Client must live for the entire generator lifetime — do NOT use a helper
     # function that returns the response, as the context manager would close it.
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)) as client:
         async with client.stream(
             "POST",
             f"{BASE_URL}/chat/completions",
@@ -327,57 +418,83 @@ async def stream_openrouter(
 
 async def call_with_fallback(
     model: str,
-    messages: list[Message],
+    messages: list,
     temperature: Optional[float],
     max_tokens: Optional[int],
+    tools: Optional[list] = None,
+    extra_fallbacks: Optional[list[str]] = None,
 ) -> tuple[dict, str]:
-    """Non-streaming with fallback. Returns (response_dict, model_used)."""
-    for attempt_model in [model, MODEL_FALLBACK]:
+    """Non-streaming with fallback. Returns (response_dict, model_used).
+    Tries: model → extra_fallbacks (class tiers) → MODEL_FALLBACK (global paid).
+    """
+    candidates = [model] + (extra_fallbacks or [])
+    if MODEL_FALLBACK not in candidates:
+        candidates.append(MODEL_FALLBACK)
+    for attempt_model in candidates:
         try:
-            result = await call_openrouter(attempt_model, messages, temperature, max_tokens)
+            result = await call_openrouter(attempt_model, messages, temperature, max_tokens, tools)
             if attempt_model != model:
                 log.warning("Fallback used: %s → %s", model, attempt_model)
             return result, attempt_model
         except httpx.HTTPStatusError as e:
-            if e.response.status_code in (429, 503, 502) and attempt_model != MODEL_FALLBACK:
-                log.warning("Model %s returned %d, trying fallback", model, e.response.status_code)
+            if e.response.status_code in (400, 402, 404, 422, 429, 502, 503) and attempt_model != candidates[-1]:
+                log.warning("Model %s returned %d, trying next", attempt_model, e.response.status_code)
                 continue
+            if e.response.status_code == 400 and tools:
+                log.warning("Model %s returned 400 with tools — retrying without tools", attempt_model)
+                result = await call_openrouter(attempt_model, messages, temperature, max_tokens, tools=None)
+                return result, attempt_model
             raise
     raise HTTPException(status_code=503, detail="All models unavailable")
 
 
 async def stream_with_fallback(
     model: str,
-    messages: list[Message],
+    messages: list,
     temperature: Optional[float],
     max_tokens: Optional[int],
+    tools: Optional[list] = None,
+    extra_fallbacks: Optional[list[str]] = None,
 ) -> AsyncGenerator[bytes, None]:
     """
-    Streaming with fallback. Tries MODEL_FALLBACK if first model fails on first chunk.
+    Streaming with fallback.
+    Tries: model → extra_fallbacks (class tiers) → MODEL_FALLBACK (global paid).
+    On HTTP 400 with tools: retries same model without tools.
     Yields raw SSE bytes; client lifecycle is fully contained inside.
     """
-    for attempt_model in [model, MODEL_FALLBACK]:
+    candidates = [model] + (extra_fallbacks or [])
+    if MODEL_FALLBACK not in candidates:
+        candidates.append(MODEL_FALLBACK)
+    last = candidates[-1]
+    for attempt_model in candidates:
         try:
             first_chunk = True
-            async for chunk in stream_openrouter(attempt_model, messages, temperature, max_tokens):
+            async for chunk in stream_openrouter(attempt_model, messages, temperature, max_tokens, tools):
                 first_chunk = False
                 yield chunk
             return  # stream completed successfully
         except httpx.HTTPStatusError as e:
-            if first_chunk and e.response.status_code in (429, 503, 502) and attempt_model != MODEL_FALLBACK:
-                log.warning("Stream fallback: %s → %s (HTTP %d)", model, MODEL_FALLBACK, e.response.status_code)
+            if first_chunk and e.response.status_code in (400, 402, 404, 422, 429, 502, 503) and attempt_model != last:
+                log.warning("Stream fallback: %s → next (HTTP %d)", attempt_model, e.response.status_code)
                 continue
+            if first_chunk and e.response.status_code == 400 and tools:
+                log.warning("Model %s returned 400 with tools — retrying without tools", attempt_model)
+                async for chunk in stream_openrouter(attempt_model, messages, temperature, max_tokens, tools=None):
+                    yield chunk
+                return
             raise
         except Exception:
-            if attempt_model != MODEL_FALLBACK:
-                log.warning("Stream fallback: %s → %s (exception)", model, MODEL_FALLBACK)
+            if attempt_model != last:
+                log.warning("Stream fallback: %s → next (exception)", attempt_model)
                 continue
             raise
     raise HTTPException(status_code=503, detail="All models unavailable")
 
 # ─── Background Memory Store ─────────────────────────────────
 
-async def store_interaction(messages: list[Message], response_text: str) -> None:
+async def store_interaction(
+    messages: list[Message], response_text: str, user_id: str = "default"
+) -> None:
     """Silently store the interaction in memory service."""
     try:
         # Extract last user message as the query
@@ -391,6 +508,7 @@ async def store_interaction(messages: list[Message], response_text: str) -> None
                 json={
                     "query":    last_user[:500],
                     "response": response_text[:1000],
+                    "user_id":  user_id,
                     "metadata": {"timestamp": time.time()},
                 },
             )
@@ -405,6 +523,7 @@ async def _stream_and_remember(
     temperature: Optional[float],
     max_tokens: Optional[int],
     feature: str = "standard",
+    user_id: str = "default",
 ) -> AsyncGenerator[bytes, None]:
     """
     Proper streaming generator:
@@ -432,7 +551,7 @@ async def _stream_and_remember(
                 pass
 
     latency_ms = int((time.monotonic() - t_start) * 1000)
-    asyncio.create_task(store_interaction(messages, "".join(full_response)))
+    asyncio.create_task(store_interaction(messages, "".join(full_response), user_id))
 
     if usage:
         asyncio.create_task(asyncio.to_thread(
@@ -446,6 +565,272 @@ async def _stream_and_remember(
             latency_ms,
         ))
 
+# ─── Tool Calling ────────────────────────────────────────────
+
+async def _keepalive_stream(
+    gen: AsyncGenerator[bytes, None],
+    interval: float = 2.0,
+) -> AsyncGenerator[bytes, None]:
+    """
+    Wrap an async byte generator, injecting SSE keepalive comment lines
+    whenever no chunk arrives within `interval` seconds.
+
+    This prevents SSE clients (Continue IDE, browsers) from timing out
+    during long LLM think-times or between tool-call iterations.
+    """
+    queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
+
+    async def _producer() -> None:
+        try:
+            async for chunk in gen:
+                await queue.put(chunk)
+        finally:
+            await queue.put(None)  # sentinel — generator exhausted
+
+    task = asyncio.create_task(_producer())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=interval)
+            except asyncio.TimeoutError:
+                yield b": keepalive\n\n"
+                continue
+            if item is None:
+                break
+            yield item
+    finally:
+        task.cancel()
+
+
+def _sse_chunk(text: str) -> bytes:
+    """Wrap plain text as an SSE content delta chunk."""
+    chunk = {"choices": [{"delta": {"content": text}, "finish_reason": None, "index": 0}]}
+    return f"data: {json.dumps(chunk)}\n\n".encode()
+
+
+def _acc_tool_calls(acc: dict[int, dict], tool_calls_delta: list) -> None:
+    """Merge streaming tool-call delta chunks into acc[index]."""
+    for tc in tool_calls_delta:
+        idx = tc.get("index", 0)
+        if idx not in acc:
+            acc[idx] = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+        if tc.get("id"):
+            acc[idx]["id"] = tc["id"]
+        fn = tc.get("function", {})
+        acc[idx]["function"]["name"]      += fn.get("name", "")
+        acc[idx]["function"]["arguments"] += fn.get("arguments", "")
+
+
+async def _tool_loop_non_streaming(
+    model: str,
+    messages: list[dict],
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+) -> tuple[dict, list[dict]]:
+    """
+    Non-streaming tool-calling loop.
+    Calls the LLM with TOOL_DEFINITIONS; if it returns tool_calls, executes them
+    and loops. Returns (final_response, updated_message_list).
+    """
+    msgs = list(messages)
+    for _ in range(5):
+        result, _ = await call_with_fallback(model, msgs, temperature, max_tokens, TOOL_DEFINITIONS)
+        choice = result["choices"][0]
+        if choice.get("finish_reason") != "tool_calls":
+            return result, msgs
+        tool_calls = choice.get("message", {}).get("tool_calls", [])
+        if not tool_calls:
+            return result, msgs
+        msgs.append(choice["message"])
+        for tc in tool_calls:
+            try:
+                args = json.loads(tc["function"]["arguments"])
+            except Exception:
+                args = {}
+            log.info("Tool: %s(%s)", tc["function"]["name"], list(args.keys()))
+            tool_result = await execute_tool(tc["function"]["name"], args)
+            # Image bypass: wrap URL as markdown so the LLM can reference it
+            if tc["function"]["name"] == "generate_image" and tool_result.startswith("http"):
+                tool_result = f"![Generiertes Bild]({tool_result})"
+            msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": tool_result})
+    return result, msgs
+
+
+async def _stream_with_tool_loop(
+    model: str,
+    messages: list[dict],
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    feature: str,
+    user_id: str = "default",
+) -> AsyncGenerator[bytes, None]:
+    """
+    Streaming with tool-calling support.
+
+    Strategy:
+    - Buffer SSE chunks until it's clear whether the response is plain text
+      or a tool call (tool_calls appear in the first non-trivial delta).
+    - Plain text → flush buffer and pass subsequent chunks through directly.
+    - Tool calls → accumulate, execute, loop back for the next LLM turn.
+
+    This keeps zero first-byte latency for the common (no-tool) case.
+    """
+    msgs = list(messages)
+
+    for iteration in range(5):
+        pre_buffer: list[bytes] = []   # chunks before we know text vs. tool-call
+        tool_acc: dict[int, dict] = {} # accumulated tool call fragments
+        decided     = False            # True once text or tool_calls detected
+        is_tool     = False
+        asst_text   = ""               # assistant content during tool-call response
+        full_text: list[str] = []      # collected for memory storage
+        usage: dict = {}
+
+        async for raw_chunk in _keepalive_stream(
+            stream_with_fallback(model, msgs, temperature, max_tokens, TOOL_DEFINITIONS)
+        ):
+            for line in raw_chunk.decode(errors="ignore").split("\n"):
+                if not line.startswith("data: "):
+                    continue
+                if line == "data: [DONE]":
+                    if not is_tool:
+                        yield b"data: [DONE]\n\n"
+                    break
+
+                try:
+                    parsed = json.loads(line[6:])
+                except Exception:
+                    if decided and not is_tool:
+                        yield (line + "\n\n").encode()
+                    else:
+                        pre_buffer.append((line + "\n\n").encode())
+                    continue
+
+                choice = parsed.get("choices", [{}])[0]
+                delta  = choice.get("delta", {})
+                if "usage" in parsed:
+                    usage = parsed["usage"]
+
+                if not decided:
+                    if "tool_calls" in delta:
+                        decided = True
+                        is_tool = True
+                        _acc_tool_calls(tool_acc, delta["tool_calls"])
+                    elif delta.get("content"):
+                        decided = True
+                        is_tool = False
+                        for b in pre_buffer:
+                            yield b
+                        pre_buffer.clear()
+                        yield (line + "\n\n").encode()
+                        full_text.append(delta["content"])
+                    else:
+                        pre_buffer.append((line + "\n\n").encode())
+                elif is_tool:
+                    if "tool_calls" in delta:
+                        _acc_tool_calls(tool_acc, delta["tool_calls"])
+                    if delta.get("content"):
+                        asst_text += delta["content"]
+                else:
+                    # Text mode — but model may still switch to tool_calls after initial text
+                    if "tool_calls" in delta:
+                        is_tool = True
+                        _acc_tool_calls(tool_acc, delta["tool_calls"])
+                        # Don't yield tool_call chunks to OWT — handle internally
+                    else:
+                        yield (line + "\n\n").encode()
+                        if delta.get("content"):
+                            full_text.append(delta["content"])
+
+        if not is_tool:
+            # Text response was fully streamed — fire-and-forget memory + cost + usage
+            asyncio.create_task(store_interaction(msgs, "".join(full_text), user_id))
+            asyncio.create_task(increment_usage(model, redis))
+            if usage:
+                asyncio.create_task(asyncio.to_thread(
+                    store_cost, model,
+                    usage.get("prompt_tokens", 0),
+                    usage.get("completion_tokens", 0),
+                    usage.get("cost", 0.0),
+                    feature, None, 0,
+                ))
+            return
+
+        # ── Execute tool calls with <think> progress display ──────
+        tool_calls = [tool_acc[i] for i in sorted(tool_acc)]
+        msgs.append({"role": "assistant", "content": asst_text or None, "tool_calls": tool_calls})
+
+        yield _sse_chunk("<think>\n")
+
+        tool_results: dict[str, str] = {}
+        for tc in tool_calls:
+            name = tc["function"]["name"]
+            try:
+                args = json.loads(tc["function"]["arguments"])
+            except Exception:
+                args = {}
+
+            # ── Show what we're doing ─────────────────────────
+            if name == "web_search":
+                query = args.get("query", "")
+                yield _sse_chunk(f'🔍 Suche: "{query}"\n')
+            elif name == "bash":
+                cmd = args.get("command", "").replace("\n", " ").strip()[:120]
+                yield _sse_chunk(f'💻 $ {cmd}\n')
+            elif name == "generate_image":
+                prompt = args.get("prompt", "")[:80]
+                yield _sse_chunk(f'🖼️ Generiere Bild: "{prompt}"\n')
+            elif name == "reset_bash":
+                yield _sse_chunk("🔄 Bash-Session zurücksetzen\n")
+
+            log.info("Tool: %s(%s)", name, list(args.keys()))
+            # Run tool while sending keepalive pings every 2s so clients
+            # (Continue, OWT) don't time out during slow tool execution
+            exec_task = asyncio.create_task(execute_tool(name, args))
+            while not exec_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(exec_task), timeout=2.0)
+                except asyncio.TimeoutError:
+                    yield b": keepalive\n\n"
+            result = exec_task.result()
+            tool_results[tc["id"]] = result
+
+            # ── Show result summary ───────────────────────────
+            if name == "web_search":
+                n_src = result.count("Source: ")
+                yield _sse_chunk(f"→ {n_src} Quellen gelesen\n\n")
+            elif name == "bash":
+                first = result.splitlines()[0][:100] if result.strip() else "(kein Output)"
+                yield _sse_chunk(f"→ {first}\n\n")
+            elif name == "generate_image":
+                if result.startswith("http"):
+                    yield _sse_chunk("→ Bild generiert ✓\n\n")
+                else:
+                    yield _sse_chunk(f"→ Fehler: {result[:80]}\n\n")
+            elif name == "reset_bash":
+                yield _sse_chunk("→ Session zurückgesetzt ✓\n\n")
+
+            msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+
+        yield _sse_chunk("</think>\n\n")
+
+        # ── Image bypass: stream markdown directly, skip second LLM call ──
+        only_image = (
+            len(tool_calls) == 1
+            and tool_calls[0]["function"]["name"] == "generate_image"
+        )
+        if only_image:
+            url = tool_results[tool_calls[0]["id"]]
+            if url.startswith("http"):
+                yield _sse_chunk(f"![Generiertes Bild]({url})\n")
+            else:
+                yield _sse_chunk(url)  # error message
+            yield b"data: [DONE]\n\n"
+            return
+
+    yield b"data: [DONE]\n\n"
+
+
 # ─── Routes ──────────────────────────────────────────────────
 
 @app.get("/health")
@@ -456,16 +841,32 @@ async def health():
 @app.get("/models")
 @app.get("/v1/models")
 async def list_models():
-    """Return available models in OpenAI-compatible format."""
-    seen: set[str] = set()
-    entries = [
-        {"id": MODEL_VISION,   "object": "model", "owned_by": "openrouter", "role": "vision"},
-        {"id": MODEL_COMPLEX,  "object": "model", "owned_by": "openrouter", "role": "complex"},
-        {"id": MODEL_FAST,     "object": "model", "owned_by": "openrouter", "role": "fast"},
-        {"id": MODEL_FALLBACK, "object": "model", "owned_by": "openrouter", "role": "fallback"},
+    """
+    Return available models in OpenAI-compatible format.
+
+    OWT Dropdown (4 entries):
+      - auto      → existing heuristic (keyword + complexity routing)
+      - denker    → DeepSeek R1 / reasoning, chat
+      - allrounder → Llama 3.1 8B / general chat
+      - begleiter → Mistral 7B / simple companion
+
+    Coding classes (titan, professional, flitzer) are intentionally omitted —
+    they are only reachable via direct alias input in Cline / the IDE.
+    """
+    models = [
+        {"id": "auto",         "object": "model", "owned_by": "router", "role": "auto-routing"},
+        {"id": "denker",       "object": "model", "owned_by": "router", "role": "chat-denker"},
+        {"id": "allrounder",   "object": "model", "owned_by": "router", "role": "chat-allrounder"},
+        {"id": "begleiter",    "object": "model", "owned_by": "router", "role": "chat-begleiter"},
     ]
-    models = [e for e in entries if not (e["id"] in seen or seen.add(e["id"]))]
     return {"object": "list", "data": models}
+
+
+@app.get("/v1/models/status")
+async def model_status():
+    """Return current tier usage for all 6 model classes."""
+    redis = await get_redis()
+    return await get_class_status(redis)
 
 
 @app.post("/v1/completions")
@@ -494,89 +895,81 @@ async def legacy_completions(request: Request):
 async def chat_completions(request: Request, body: ChatRequest):
     redis = await get_redis()
 
-    # Rate limit by client IP
     client_ip = request.client.host if request.client else "unknown"
     await check_rate_limit(client_ip, redis)
 
-    # Only check the last user message for dispatch triggers —
-    # checking all messages causes false positives on injected system context.
-    last_user_msgs = [m for m in body.messages if m.role == "user"]
-    last_user_text = _extract_text([last_user_msgs[-1]]) if last_user_msgs else ""
+    # Coding classes (titan/professional/flitzer) are Cline-only:
+    # skip router tool injection and require no tool-capable tier.
+    resolved_class = ALIASES.get((body.model or "").lower())
+    is_coding = resolved_class in CODING_CLASSES
 
-    audio_triggered, display_mode = detect_audio_trigger(last_user_text)
-    if audio_triggered:
-        log.info("Dispatch: AUDIO (text command, mode=%s)", display_mode)
-
-    triggered_imagegen, _ = detect_imagegen_trigger(last_user_text)
-    if triggered_imagegen:
-        log.info("Dispatch: IMAGEGEN → %s", os.getenv("MODEL_IMAGEGEN", "black-forest-labs/flux-schnell"))
-        msgs = [m.model_dump() for m in body.messages]
-        return StreamingResponse(
-            imagegen_dispatcher.handle(msgs),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
-                     "X-Model-Routed": "imagegen"},
-        )
-
-    if detect_research_trigger(last_user_text):
-        log.info("Dispatch: RESEARCH")
-        msgs = [m.model_dump() for m in body.messages]
-        return StreamingResponse(
-            research_dispatcher.handle(msgs, body.stream, body.temperature, body.max_tokens),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
-                     "X-Model-Routed": "research"},
-        )
-
-    # Select model via routing logic
-    model = select_model(body)
+    # need_tools: only inject router tools for non-coding, non-client-tools requests
+    client_tools_present = bool(body.tools)
+    need_tools = not client_tools_present and not is_coding
+    model, fallback_chain = await resolve_model(body, redis, need_tools)
     feature = detect_feature(body, model)
 
-    # Inject memories from previous sessions
+    # ── Resolve user identity ────────────────────────────────
+    raw_key = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    user_id = await _resolve_user_id(raw_key, dict(request.headers), redis)
+
     messages = body.messages
     if body.use_memory:
-        query = _extract_text(messages)
-        messages = await inject_memories(messages, query)
+        messages = await inject_memories(messages, _extract_text(messages), user_id)
 
-    # Cache lookup (skip for streaming)
-    if not body.stream:
-        cache_key = _cache_key(model, messages)
-        cached = await get_cached(cache_key, redis)
-        if cached:
-            log.debug("Cache hit for model=%s", model)
-            cached["_cached"] = True
-            return JSONResponse(cached)
+    msgs = [m.model_dump(exclude_none=True) for m in messages]
+
+    client_tools = body.tools or None
+    # Direct proxy: coding classes (Cline) or client-provided tools skip the
+    # router's own tool loop entirely — cleaner, no injection, Cline-compatible.
+    direct_proxy = is_coding or bool(client_tools)
+    log.info("Request: model=%s class=%s user=%s stream=%s direct=%s",
+             body.model, resolved_class or "auto", user_id, body.stream, direct_proxy)
 
     # ── Streaming path ───────────────────────────────────────
     if body.stream:
+        if direct_proxy:
+            return StreamingResponse(
+                _keepalive_stream(
+                    stream_with_fallback(model, msgs, body.temperature, body.max_tokens,
+                                         client_tools, fallback_chain)
+                ),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                         "X-Model-Routed": model,
+                         "X-Tool-Mode": "client" if client_tools else "direct"},
+            )
         return StreamingResponse(
-            _stream_and_remember(model, messages, body.temperature, body.max_tokens, feature),
+            _stream_with_tool_loop(model, msgs, body.temperature, body.max_tokens, feature, user_id),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control":    "no-cache",
-                "X-Accel-Buffering": "no",
-                "X-Model-Routed":   model,
-            },
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                     "X-Model-Routed": model},
         )
 
     # ── Non-streaming path ───────────────────────────────────
-    result, used_model = await call_with_fallback(
-        model, messages, body.temperature, body.max_tokens
-    )
+    cache_key = _cache_key(model, messages)
+    cached = await get_cached(cache_key, redis)
+    if cached:
+        log.debug("Cache hit for model=%s", model)
+        cached["_cached"] = True
+        return JSONResponse(cached)
 
-    # Inject routing metadata
-    result["_routing"] = {"requested": model, "used": used_model}
+    if direct_proxy:
+        result, _ = await call_with_fallback(model, msgs, body.temperature, body.max_tokens,
+                                              client_tools, fallback_chain)
+    else:
+        result, _ = await _tool_loop_non_streaming(model, msgs, body.temperature, body.max_tokens)
+    result["_routing"] = {"model": model}
 
-    # Cache + store memory + track cost async
-    asyncio.create_task(set_cached(cache_key, result, redis))
     response_text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-    asyncio.create_task(store_interaction(messages, response_text))
+    asyncio.create_task(set_cached(cache_key, result, redis))
+    asyncio.create_task(store_interaction(messages, response_text, user_id))
+    asyncio.create_task(increment_usage(model, redis))
 
     usage = result.get("usage", {})
     if usage:
         asyncio.create_task(asyncio.to_thread(
-            store_cost,
-            used_model,
+            store_cost, model,
             usage.get("prompt_tokens", 0),
             usage.get("completion_tokens", 0),
             usage.get("cost", 0.0),

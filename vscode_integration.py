@@ -343,6 +343,15 @@ async def handle_web_search(args: dict) -> dict:
     query       = args["query"]
     max_results = int(args.get("max_results", 5))
 
+    if len(query) > 300:
+        return {
+            "type": "text",
+            "text": (
+                f"Query too long ({len(query)} chars, max 300). "
+                "Please provide a short search term, not file content or code."
+            ),
+        }
+
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
             f"{SEARXNG_URL}/search",

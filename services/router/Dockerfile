@@ -14,6 +14,8 @@ COPY app.py .
 COPY utils/ utils/
 COPY routes/ routes/
 COPY dispatchers/ dispatchers/
+COPY tools/ tools/
+COPY models/ models/
 
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 

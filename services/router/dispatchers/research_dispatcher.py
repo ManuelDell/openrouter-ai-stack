@@ -26,6 +26,23 @@ from utils.request_analyzer import extract_urls
 
 log = logging.getLogger("research_dispatcher")
 
+_COMMAND_PREFIXES = {
+    "/web", "/search", "/internet", "/suche",
+    "/recherche", "/recherchiere", "/research",
+}
+
+
+def _extract_query(user_text: str) -> str:
+    """Strip command prefix and truncate for safe SearXNG use."""
+    text = user_text.strip()
+    lower = text.lower()
+    for cmd in _COMMAND_PREFIXES:
+        if lower.startswith(cmd + " "):
+            text = text[len(cmd):].strip()
+            break
+    return text[:400]
+
+
 API_KEY      = os.environ["OPENROUTER_API_KEY"]
 BASE_URL     = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 MODEL_VISION = os.getenv("MODEL_VISION", "qwen/qwen3-vl-32b-instruct")
@@ -169,10 +186,11 @@ async def handle(
         "",
     )
 
-    # ── Step 1: DuckDuckGo search (free, no API key) ─────────
+    # ── Step 1: SearXNG search ────────────────────────────────
+    query = _extract_query(user_text)
     yield _sse("🔍 Searching...\n\n")
     try:
-        ddg_results: list[dict] = await _searxng_search(user_text, MAX_URLS)
+        ddg_results: list[dict] = await _searxng_search(query, MAX_URLS)
     except Exception as e:
         log.warning("SearXNG search failed: %s", e)
         yield _sse(f"⚠️ Search error: {e}\n\n")
@@ -199,7 +217,7 @@ async def handle(
 
     # ── Step 2: Fetch pages in parallel ──────────────────────
     yield _sse(f"📄 Reading {len(url_snippet_pairs)} page(s)...\n\n")
-    tasks = [_fetch_source(url, snippet, user_text) for url, snippet in url_snippet_pairs]
+    tasks = [_fetch_source(url, snippet, query) for url, snippet in url_snippet_pairs]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     sources: list[str] = []
@@ -219,5 +237,5 @@ async def handle(
 
     # ── Step 3: Synthesize via DeepSeek ──────────────────────
     yield _sse("✍️ Synthesizing answer...\n\n---\n\n")
-    async for chunk in _synthesize_stream(user_text, sources, temperature, max_tokens):
+    async for chunk in _synthesize_stream(query, sources, temperature, max_tokens):
         yield chunk

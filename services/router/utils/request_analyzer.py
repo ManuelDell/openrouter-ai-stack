@@ -1,50 +1,16 @@
 """
-request_analyzer.py — Detect special dispatch triggers in incoming requests.
+request_analyzer.py — Utility functions for request inspection.
 
-Single responsibility: classify requests, return trigger flags.
-No I/O, no side effects — pure detection logic.
+Note: image generation and web search are now handled via LLM tool calling.
+This module retains only the audio-trigger detection (used for file-upload
+endpoints) and URL extraction (used by content fetchers).
 """
 
 import re
-from typing import Optional
 
-# ── Research triggers ─────────────────────────────────────────
-
-RESEARCH_COMMANDS = {
-    "/recherche", "/recherchiere",   # Deutsch
-    "/research", "/search", "/web",  # Englisch / kurz
-    "/suche", "/internet",           # Alternativ
-}
-
-RESEARCH_KEYWORDS = {
-    # German — explicit web/news/research intent
-    "nachrichten", "aktueller stand", "breaking news",
-    "was ist passiert", "neueste meldungen",
-    "suche im internet", "suche online",
-    "was steht im netz", "google mal",
-    # English — explicit web/news/research intent
-    "what happened", "latest news",
-    "what's new", "whats new",
-    "search the web", "search online",
-}
+# ── URL extraction ────────────────────────────────────────────
 
 URL_PATTERN = re.compile(r"https?://\S+")
-
-
-def detect_research_trigger(text: str) -> bool:
-    """
-    Return True if the message should be routed to the research dispatcher.
-    URL presence alone does NOT trigger research — code files contain URLs
-    (e.g. http://www.w3.org/2000/svg) and would cause false positives.
-    Only explicit commands and specific news phrases trigger research.
-    """
-    lower = text.lower()
-
-    if any(cmd in lower for cmd in RESEARCH_COMMANDS):
-        return True
-
-    words = set(lower.split())
-    return bool(words & RESEARCH_KEYWORDS)
 
 
 def extract_urls(text: str) -> list[str]:
@@ -52,42 +18,13 @@ def extract_urls(text: str) -> list[str]:
     return URL_PATTERN.findall(text)
 
 
-# ── Image-gen triggers ────────────────────────────────────────
-
-IMAGEGEN_COMMANDS = {"/imagegen", "/generate", "/bild", "/erstelle-bild"}
-
-# Exact substring phrases
-IMAGEGEN_PHRASES = {
-    "generate image", "create image", "erstelle ein bild", "generiere ein bild",
-    "make an image", "als bild generieren", "als bild erstellen",
-    "ein bild von", "ein foto von",
-}
-
-# Verb + noun word-pair detection (both must appear as separate words)
-_IMG_VERBS = {"generiere", "generier", "zeichne", "erstelle", "male", "draw", "create", "generate"}
-_IMG_NOUNS = {"bild", "image", "foto", "grafik", "illustration", "photo", "picture"}
-
-
-def detect_imagegen_trigger(text: str) -> tuple[bool, float]:
-    """Return (triggered, confidence)."""
-    lower = text.lower()
-    if any(cmd in lower for cmd in IMAGEGEN_COMMANDS):
-        return True, 1.0
-    if any(phrase in lower for phrase in IMAGEGEN_PHRASES):
-        return True, 0.9
-    words = set(lower.split())
-    if words & _IMG_VERBS and words & _IMG_NOUNS:
-        return True, 0.8
-    return False, 0.0
-
-
 # ── Audio triggers ────────────────────────────────────────────
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".webm"}
-AUDIO_COMMANDS = {"/transkribiere", "/transcribe"}
+AUDIO_COMMANDS   = {"/transkribiere", "/transcribe"}
 
 AUDIO_DISPLAY_MODE = "visible"
-AUDIO_SILENT_MODE = "silent"
+AUDIO_SILENT_MODE  = "silent"
 
 
 def detect_audio_trigger(text: str, has_audio_file: bool = False) -> tuple[bool, str]:
