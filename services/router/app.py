@@ -369,6 +369,7 @@ def _build_payload(
         payload["max_tokens"] = max_tokens
     if tools:
         payload["tools"] = tools
+        payload["tool_choice"] = "auto"
     return payload
 
 
@@ -777,6 +778,25 @@ async def _stream_with_tool_loop(
     This keeps zero first-byte latency for the common (no-tool) case.
     """
     msgs = list(messages)
+
+    # Ensure the model knows exactly which tools it has and must use them via tool_calls.
+    # Without this, reasoning models (e.g. DeepSeek R1) often respond with plain text
+    # describing what they would do instead of actually calling the tools.
+    _TOOL_HINT = (
+        "Du hast folgende Tools die du aktiv per tool_call nutzen MUSST — "
+        "beschreibe NICHT was du tun würdest, sondern führe es direkt aus:\n"
+        "• web_search(query) — Web-Suche nach aktuellen Informationen\n"
+        "• bash(command)     — Shell-Befehle: curl, wget, python, jq, grep, etc.\n"
+        "• generate_image(prompt) — KI-Bild generieren\n"
+        "• reset_bash()      — Shell-Session zurücksetzen"
+    )
+    existing_system = [m for m in msgs if m.get("role") == "system"]
+    if existing_system:
+        # Append hint to the last system message
+        last_sys = existing_system[-1]
+        last_sys["content"] = last_sys["content"].rstrip() + "\n\n" + _TOOL_HINT
+    else:
+        msgs.insert(0, {"role": "system", "content": _TOOL_HINT})
 
     for iteration in range(max_iterations):
         pre_buffer: list[bytes] = []   # chunks before we know text vs. tool-call
