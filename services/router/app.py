@@ -759,6 +759,7 @@ async def _stream_with_tool_loop(
     user_id: str = "default",
     max_iterations: int = 10,
     effort: Optional[str] = None,
+    fallback_chain: Optional[list[str]] = None,
 ) -> AsyncGenerator[bytes, None]:
     """
     Streaming with tool-calling support.
@@ -809,7 +810,7 @@ async def _stream_with_tool_loop(
         finish_reason_seen: Optional[str] = None
 
         async for raw_chunk in _keepalive_stream(
-            stream_with_fallback(model, msgs, temperature, max_tokens, TOOL_DEFINITIONS)
+            stream_with_fallback(model, msgs, temperature, max_tokens, TOOL_DEFINITIONS, fallback_chain)
         ):
             for line in raw_chunk.decode(errors="ignore").split("\n"):
                 if not line.startswith("data: "):
@@ -1011,7 +1012,7 @@ async def _stream_with_tool_loop(
         ),
     })
     async for chunk in _safe_stream(
-        stream_with_fallback(model, msgs, temperature, max_tokens, tools=None)
+        stream_with_fallback(model, msgs, temperature, max_tokens, tools=None, extra_fallbacks=fallback_chain)
     ):
         yield chunk
 
@@ -1173,7 +1174,7 @@ async def chat_completions(request: Request, body: ChatRequest):
         return StreamingResponse(
             _safe_stream(_stream_with_tool_loop(
                 model, msgs, body.temperature, body.max_tokens, feature, user_id,
-                max_iter, body.reasoning_effort
+                max_iter, body.reasoning_effort, fallback_chain
             )),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",

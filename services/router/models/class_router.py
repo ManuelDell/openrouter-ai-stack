@@ -34,9 +34,9 @@ MODEL_CLASSES: dict[str, list[dict]] = {
     ],
     # ── Chat-Klassen (erscheinen im OWT-Dropdown) ───────────────────────────
     "denker": [
-        {"model": os.getenv("DENKER_FREE1", "qwen/qwen3-235b-a22b:free"),              "limit": 10,  "tools": True},
-        {"model": os.getenv("DENKER_FREE2", "deepseek/deepseek-r1:free"),              "limit": 20,  "tools": True},
-        {"model": os.getenv("DENKER_PAID",  "deepseek/deepseek-r1"),                   "limit": None, "tools": True},
+        {"model": os.getenv("DENKER_FREE1", "qwen/qwen3-next-80b-a3b-instruct:free"), "limit": 10,  "tools": True},
+        {"model": os.getenv("DENKER_FREE2", "meta-llama/llama-3.3-70b-instruct:free"),"limit": 20,  "tools": True},
+        {"model": os.getenv("DENKER_PAID",  "qwen/qwq-32b"),                          "limit": None, "tools": True},
     ],
     "allrounder": [
         {"model": os.getenv("ALLROUNDER_FREE1", "meta-llama/llama-3.3-70b-instruct:free"), "limit": 50, "tools": True},
