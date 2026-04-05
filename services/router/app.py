@@ -118,6 +118,7 @@ class ChatRequest(BaseModel):
     use_memory: bool = True               # inject relevant memories
     metadata: Optional[dict] = None
     tools: Optional[list] = None          # client-provided tools (e.g. Continue agent)
+    reasoning_effort: Optional[str] = None  # "low" | "medium" | "high" → tool iteration budget
 
 # ─── Routing Logic ───────────────────────────────────────────
 
@@ -756,6 +757,7 @@ async def _stream_with_tool_loop(
     feature: str,
     user_id: str = "default",
     max_iterations: int = 10,
+    effort: Optional[str] = None,
 ) -> AsyncGenerator[bytes, None]:
     """
     Streaming with tool-calling support.
@@ -942,6 +944,22 @@ async def _stream_with_tool_loop(
 
         yield _sse_chunk("</think>\n\n")
 
+        # ── High-effort self-check every 10 iterations ────────────────────
+        if effort == "high" and iteration > 0 and (iteration + 1) % 10 == 0:
+            yield _sse_chunk(
+                f"\n🔍 *Fortschrittscheck nach {iteration + 1} Runden — "
+                "überprüfe ob bereits eine sinnvolle Antwort möglich ist...*\n\n"
+            )
+            msgs.append({
+                "role": "user",
+                "content": (
+                    "[SYSTEM-CHECK] Überprüfe deinen bisherigen Fortschritt: "
+                    "Hast du ausreichend Informationen um die ursprüngliche Aufgabe vollständig "
+                    "zu beantworten? Wenn ja — antworte jetzt mit deinen Erkenntnissen. "
+                    "Wenn nein — erkläre in einem Satz was noch fehlt und mache weiter."
+                ),
+            })
+
         # ── Image bypass: stream markdown directly, skip second LLM call ──
         only_image = (
             len(tool_calls) == 1
@@ -958,14 +976,24 @@ async def _stream_with_tool_loop(
             yield b"data: [DONE]\n\n"
             return
 
-    # Loop exhausted without a final text response
+    # Loop exhausted — force a final answer with gathered information (no error message)
     yield _sse_chunk(
-        f"\n\n⚠️ **Aufgabe nicht abgeschlossen** — nach {max_iterations} Tool-Runden "
-        "ohne abschließende Antwort. Bitte formuliere die Aufgabe neu oder teile sie in "
-        "kleinere Schritte auf.\n"
+        f"\n\n📋 *{max_iterations} Recherche-Runden ausgeschöpft — "
+        "erstelle Antwort mit den gesammelten Informationen...*\n\n"
     )
-    yield b'data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}]}\n\n'
-    yield b"data: [DONE]\n\n"
+    msgs.append({
+        "role": "user",
+        "content": (
+            "Du hast alle verfügbaren Recherche-Runden verwendet. "
+            "Fasse jetzt alle gesammelten Informationen zu einer vollständigen Antwort zusammen. "
+            "Wenn Informationen fehlen, benenne das klar — aber gib auf jeden Fall eine "
+            "strukturierte Antwort mit dem was du weißt."
+        ),
+    })
+    async for chunk in _safe_stream(
+        stream_with_fallback(model, msgs, temperature, max_tokens, tools=None)
+    ):
+        yield chunk
 
 
 # ─── Routes ──────────────────────────────────────────────────
@@ -1095,9 +1123,19 @@ async def chat_completions(request: Request, body: ChatRequest):
     log.info("Request: model=%s class=%s user=%s stream=%s direct=%s",
              body.model, resolved_class or "auto", user_id, body.stream, direct_proxy)
 
-    # Tool-loop iteration limit: small models lose context fast, large ones can go deeper.
+    # Tool-loop iteration limit: driven by reasoning_effort when set, else class-based defaults.
+    # reasoning_effort is a native OWT parameter (Chat Controls → Advanced Parameters).
+    _EFFORT_ITERATIONS: dict[str, int] = {"low": 6, "medium": 15, "high": 50}
     _SMALL_CLASSES = {"begleiter", "flitzer"}
-    max_iter = 5 if resolved_class in _SMALL_CLASSES else 10
+    if body.reasoning_effort in _EFFORT_ITERATIONS:
+        max_iter = _EFFORT_ITERATIONS[body.reasoning_effort]
+    elif resolved_class == "denker":
+        max_iter = 50   # denker default: deep research, no artificial cap
+    elif resolved_class in _SMALL_CLASSES:
+        max_iter = 5
+    else:
+        max_iter = 10
+    log.info("Tool iterations: max=%d (effort=%s class=%s)", max_iter, body.reasoning_effort, resolved_class)
 
     # ── Streaming path ───────────────────────────────────────
     if body.stream:
@@ -1114,7 +1152,8 @@ async def chat_completions(request: Request, body: ChatRequest):
             )
         return StreamingResponse(
             _safe_stream(_stream_with_tool_loop(
-                model, msgs, body.temperature, body.max_tokens, feature, user_id, max_iter
+                model, msgs, body.temperature, body.max_tokens, feature, user_id,
+                max_iter, body.reasoning_effort
             )),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
