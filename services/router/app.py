@@ -804,6 +804,7 @@ async def _stream_with_tool_loop(
         tool_acc: dict[int, dict] = {} # accumulated tool call fragments
         decided          = False       # True once text or tool_calls detected
         is_tool          = False
+        in_think_block   = False       # True while streaming <think> reasoning (QwQ/R1)
         asst_text        = ""          # assistant content during tool-call response
         full_text: list[str] = []      # collected for memory storage
         usage: dict      = {}
@@ -841,10 +842,20 @@ async def _stream_with_tool_loop(
 
                 if not decided:
                     if "tool_calls" in delta:
+                        # Flush buffered setup chunks, close any open think block
+                        for b in pre_buffer:
+                            yield b
+                        pre_buffer.clear()
+                        if in_think_block:
+                            yield _sse_chunk("\n</think>\n\n")
+                            in_think_block = False
                         decided = True
                         is_tool = True
                         _acc_tool_calls(tool_acc, delta["tool_calls"])
                     elif delta.get("content"):
+                        if in_think_block:
+                            yield _sse_chunk("\n</think>\n\n")
+                            in_think_block = False
                         decided = True
                         is_tool = False
                         for b in pre_buffer:
@@ -852,6 +863,18 @@ async def _stream_with_tool_loop(
                         pre_buffer.clear()
                         yield (line + "\n\n").encode()
                         full_text.append(delta["content"])
+                    elif delta.get("reasoning"):
+                        # Reasoning model (QwQ/R1 via reasoning field) — stream thinking
+                        # immediately to keep OWT connection alive. Without this, models
+                        # that produce 100+ reasoning-only chunks before content/tool_calls
+                        # cause OWT to timeout with an empty response.
+                        if not in_think_block:
+                            for b in pre_buffer:  # flush role-setup chunks first
+                                yield b
+                            pre_buffer.clear()
+                            yield _sse_chunk("<think>")
+                            in_think_block = True
+                        yield _sse_chunk(delta["reasoning"])
                     else:
                         pre_buffer.append((line + "\n\n").encode())
                 elif is_tool:
