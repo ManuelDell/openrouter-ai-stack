@@ -497,9 +497,15 @@ async def stream_with_fallback(
                 continue
             if first_chunk and e.response.status_code == 400 and tools:
                 log.warning("Model %s returned 400 with tools — retrying without tools", attempt_model)
-                async for chunk in stream_openrouter(attempt_model, messages, temperature, max_tokens, tools=None):
-                    yield chunk
-                return
+                try:
+                    async for chunk in stream_openrouter(attempt_model, messages, temperature, max_tokens, tools=None):
+                        yield chunk
+                    return
+                except httpx.HTTPStatusError as e2:
+                    if attempt_model != last:
+                        log.warning("Model %s returned %d without tools — falling back", attempt_model, e2.response.status_code)
+                        continue
+                    raise
             raise
         except RuntimeError as e:
             if attempt_model != last:
@@ -631,6 +637,69 @@ def _sse_chunk(text: str) -> bytes:
     return f"data: {json.dumps(chunk)}\n\n".encode()
 
 
+async def _safe_stream(gen: AsyncGenerator[bytes, None]) -> AsyncGenerator[bytes, None]:
+    """
+    Wrap any streaming generator so that unhandled exceptions are surfaced
+    as a visible SSE error chunk instead of a silent connection drop.
+    """
+    try:
+        async for chunk in gen:
+            yield chunk
+    except Exception as e:
+        msg = f"\n\n⚠️ **Verbindungsfehler:** {type(e).__name__}: {str(e)[:200]}"
+        yield _sse_chunk(msg)
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}]}\n\n'
+        yield b"data: [DONE]\n\n"
+        log.error("Streaming exception surfaced to user: %s", e, exc_info=True)
+
+
+async def _compress_context(msgs: list[dict], model: str) -> list[dict]:
+    """
+    Token-limit reached: ask the model for a structured summary of the work
+    so far, then rebuild the message list with only system prompts + summary.
+    The original user task is preserved so the model can continue seamlessly.
+    """
+    original_task = next(
+        (m["content"] for m in msgs if m.get("role") == "user"),
+        "Aufgabe unbekannt",
+    )
+    if isinstance(original_task, list):
+        original_task = " ".join(
+            p.get("text", "") for p in original_task if isinstance(p, dict)
+        )
+    system_msgs = [m for m in msgs if m.get("role") == "system"]
+    summary_prompt = (
+        "Fasse die bisherige Arbeit in max. 400 Wörtern zusammen:\n"
+        "1. Aufgabe (was war gefragt)\n"
+        "2. Durchgeführte Schritte und Recherchen\n"
+        "3. Wichtige Erkenntnisse und Ergebnisse\n"
+        "4. Was noch offen/unfertig ist\n\n"
+        "Schreibe NUR die Zusammenfassung, keine Einleitung."
+    )
+    try:
+        summary_resp, _ = await call_with_fallback(
+            model,
+            msgs + [{"role": "user", "content": summary_prompt}],
+            temperature=0.3,
+            max_tokens=600,
+        )
+        summary = summary_resp["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log.warning("Context compression failed: %s", e)
+        summary = "[Zusammenfassung nicht verfügbar]"
+    log.info("Context compressed for model=%s", model)
+    return system_msgs + [
+        {
+            "role": "user",
+            "content": (
+                f"## Bisheriger Fortschritt (Kontext komprimiert)\n{summary}\n\n"
+                f"## Originalaufgabe\n{original_task}\n\n"
+                "Fahre nun nahtlos mit der Aufgabe fort."
+            ),
+        }
+    ]
+
+
 def _acc_tool_calls(acc: dict[int, dict], tool_calls_delta: list) -> None:
     """Merge streaming tool-call delta chunks into acc[index]."""
     for tc in tool_calls_delta:
@@ -686,6 +755,7 @@ async def _stream_with_tool_loop(
     max_tokens: Optional[int],
     feature: str,
     user_id: str = "default",
+    max_iterations: int = 10,
 ) -> AsyncGenerator[bytes, None]:
     """
     Streaming with tool-calling support.
@@ -696,18 +766,25 @@ async def _stream_with_tool_loop(
     - Plain text → flush buffer and pass subsequent chunks through directly.
     - Tool calls → accumulate, execute, loop back for the next LLM turn.
 
+    Safety layers:
+    - finish_reason=length → _compress_context() + continue (no silent cutoff)
+    - Empty text response   → user warning + return (no silent blank)
+    - Tool exec exception   → error string fed back to LLM
+    - Loop limit reached    → visible ⚠️ message instead of silent [DONE]
+
     This keeps zero first-byte latency for the common (no-tool) case.
     """
     msgs = list(messages)
 
-    for iteration in range(5):
+    for iteration in range(max_iterations):
         pre_buffer: list[bytes] = []   # chunks before we know text vs. tool-call
         tool_acc: dict[int, dict] = {} # accumulated tool call fragments
-        decided     = False            # True once text or tool_calls detected
-        is_tool     = False
-        asst_text   = ""               # assistant content during tool-call response
+        decided          = False       # True once text or tool_calls detected
+        is_tool          = False
+        asst_text        = ""          # assistant content during tool-call response
         full_text: list[str] = []      # collected for memory storage
-        usage: dict = {}
+        usage: dict      = {}
+        finish_reason_seen: Optional[str] = None
 
         async for raw_chunk in _keepalive_stream(
             stream_with_fallback(model, msgs, temperature, max_tokens, TOOL_DEFINITIONS)
@@ -733,6 +810,11 @@ async def _stream_with_tool_loop(
                 delta  = choice.get("delta", {})
                 if "usage" in parsed:
                     usage = parsed["usage"]
+
+                # Track finish_reason for safety checks below
+                fr = choice.get("finish_reason")
+                if fr:
+                    finish_reason_seen = fr
 
                 if not decided:
                     if "tool_calls" in delta:
@@ -765,8 +847,27 @@ async def _stream_with_tool_loop(
                         if delta.get("content"):
                             full_text.append(delta["content"])
 
+        # ── Safety checks after stream ends ──────────────────────────────
         if not is_tool:
-            # Text response was fully streamed — fire-and-forget memory + cost + usage
+            # Token-limit: compress context and retry rather than cutting off
+            if finish_reason_seen == "length":
+                yield _sse_chunk(
+                    "\n\n📝 *Kontext-Limit erreicht — erstelle Zusammenfassung und fahre fort...*\n"
+                )
+                msgs = await _compress_context(msgs, model)
+                continue  # next iteration with compressed context
+
+            # Empty response: warn user (stream_with_fallback will try next model)
+            if not "".join(full_text).strip():
+                yield _sse_chunk(
+                    "\n\n⚠️ **Modell hat keine Antwort geliefert** — bitte erneut versuchen "
+                    "oder Aufgabe umformulieren.\n"
+                )
+                yield b'data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}]}\n\n'
+                yield b"data: [DONE]\n\n"
+                return
+
+            # Normal text response — fire-and-forget memory + cost + usage
             asyncio.create_task(store_interaction(msgs, "".join(full_text), user_id))
             asyncio.create_task(increment_usage(model, _redis))
             if usage:
@@ -815,7 +916,11 @@ async def _stream_with_tool_loop(
                     await asyncio.wait_for(asyncio.shield(exec_task), timeout=2.0)
                 except asyncio.TimeoutError:
                     yield b": keepalive\n\n"
-            result = exec_task.result()
+            try:
+                result = exec_task.result()
+            except Exception as exc:
+                result = f"[Tool-Fehler] {type(exc).__name__}: {exc}"
+                log.error("Tool execution raised for %s: %s", name, exc, exc_info=True)
             tool_results[tc["id"]] = result
 
             # ── Show result summary ───────────────────────────
@@ -853,6 +958,13 @@ async def _stream_with_tool_loop(
             yield b"data: [DONE]\n\n"
             return
 
+    # Loop exhausted without a final text response
+    yield _sse_chunk(
+        f"\n\n⚠️ **Aufgabe nicht abgeschlossen** — nach {max_iterations} Tool-Runden "
+        "ohne abschließende Antwort. Bitte formuliere die Aufgabe neu oder teile sie in "
+        "kleinere Schritte auf.\n"
+    )
+    yield b'data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}]}\n\n'
     yield b"data: [DONE]\n\n"
 
 
@@ -880,6 +992,7 @@ async def list_models():
     """
     models = [
         {"id": "auto",         "object": "model", "owned_by": "router", "role": "auto-routing"},
+        {"id": "code-auto",    "object": "model", "owned_by": "router", "role": "coding-tools"},
         {"id": "denker",       "object": "model", "owned_by": "router", "role": "chat-denker"},
         {"id": "allrounder",   "object": "model", "owned_by": "router", "role": "chat-allrounder"},
         {"id": "begleiter",    "object": "model", "owned_by": "router", "role": "chat-begleiter"},
@@ -982,21 +1095,27 @@ async def chat_completions(request: Request, body: ChatRequest):
     log.info("Request: model=%s class=%s user=%s stream=%s direct=%s",
              body.model, resolved_class or "auto", user_id, body.stream, direct_proxy)
 
+    # Tool-loop iteration limit: small models lose context fast, large ones can go deeper.
+    _SMALL_CLASSES = {"begleiter", "flitzer"}
+    max_iter = 5 if resolved_class in _SMALL_CLASSES else 10
+
     # ── Streaming path ───────────────────────────────────────
     if body.stream:
         if direct_proxy:
             return StreamingResponse(
-                _keepalive_stream(
+                _safe_stream(_keepalive_stream(
                     stream_with_fallback(model, msgs, body.temperature, body.max_tokens,
                                          client_tools, fallback_chain)
-                ),
+                )),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
                          "X-Model-Routed": model,
                          "X-Tool-Mode": "client" if client_tools else "direct"},
             )
         return StreamingResponse(
-            _stream_with_tool_loop(model, msgs, body.temperature, body.max_tokens, feature, user_id),
+            _safe_stream(_stream_with_tool_loop(
+                model, msgs, body.temperature, body.max_tokens, feature, user_id, max_iter
+            )),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
                      "X-Model-Routed": model},

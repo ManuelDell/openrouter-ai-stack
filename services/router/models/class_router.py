@@ -62,6 +62,7 @@ ALIASES: dict[str, str] = {
     "professional":        "professional",
     "profi":               "professional",
     "coding-professional": "professional",
+    "code-auto":           "professional",   # Roo Code: tool-capable auto-routing
     "flitzer":             "flitzer",
     "coding-flitzer":      "flitzer",
     # Chat-Klassen
