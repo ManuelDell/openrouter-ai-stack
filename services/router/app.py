@@ -998,6 +998,17 @@ async def _stream_with_tool_loop(
 
         yield _sse_chunk("</think>\n\n")
 
+        # ── Proactive context compression ─────────────────────────────────
+        # A 500 in-stream crash from QwQ (context overflow) is NOT caught by
+        # finish_reason=length, so compress proactively before the context
+        # explodes. Threshold ~80k chars ≈ 20k tokens — safe for all models.
+        total_chars = sum(len(str(m.get("content") or "")) for m in msgs)
+        if total_chars > 80_000:
+            yield _sse_chunk(
+                "\n\n📝 *Kontext wächst — komprimiere Gesprächsverlauf...*\n\n"
+            )
+            msgs = await _compress_context(msgs, model)
+
         # ── High-effort self-check every 10 iterations ────────────────────
         if effort == "high" and iteration > 0 and (iteration + 1) % 10 == 0:
             yield _sse_chunk(
