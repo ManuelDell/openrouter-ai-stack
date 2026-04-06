@@ -836,12 +836,12 @@ async def _stream_with_tool_loop(
     # Without this, reasoning models (e.g. DeepSeek R1) often respond with plain text
     # describing what they would do instead of actually calling the tools.
     _TOOL_HINT = (
-        "Du hast folgende Tools die du aktiv per tool_call nutzen MUSST — "
-        "beschreibe NICHT was du tun würdest, sondern führe es direkt aus:\n"
-        "• web_search(query) — Web-Suche nach aktuellen Informationen\n"
-        "• bash(command)     — Shell-Befehle: curl, wget, python, jq, grep, etc.\n"
-        "• generate_image(prompt) — KI-Bild generieren\n"
-        "• reset_bash()      — Shell-Session zurücksetzen"
+        "Verfügbare Tools — direkt per tool_call ausführen, NICHT beschreiben:\n"
+        "• web_search(query:str) — Fakten, News, Preise, aktuelle Infos → IMMER nutzen statt aus Gedächtnis antworten\n"
+        "• bash(command:str, timeout?:int) — curl, jq, python, git, Dateioperationen, APIs\n"
+        "• generate_image(prompt:str) — Bild/Illustration generieren\n"
+        "• reset_bash() — Shell zurücksetzen wenn Befehle unerwartet fehlschlagen\n"
+        "Regel: Sobald du weißt was zu tun ist → Tool aufrufen. Nicht erst erklären, dann tun."
     )
     existing_system = [m for m in msgs if m.get("role") == "system"]
     if existing_system:
@@ -907,7 +907,7 @@ async def _stream_with_tool_loop(
                     finish_reason_seen = fr
 
                 if not decided:
-                    if "tool_calls" in delta:
+                    if delta.get("tool_calls"):  # guard: None/empty list → skip
                         # Flush buffered setup chunks (pre_buffer cleared by reasoning branch already)
                         for b in pre_buffer:
                             yield b
@@ -940,13 +940,13 @@ async def _stream_with_tool_loop(
                     else:
                         pre_buffer.append((line + "\n\n").encode())
                 elif is_tool:
-                    if "tool_calls" in delta:
+                    if delta.get("tool_calls"):  # guard: None/empty → skip
                         _acc_tool_calls(tool_acc, delta["tool_calls"])
                     if delta.get("content"):
                         asst_text += delta["content"]
                 else:
                     # Text mode — but model may still switch to tool_calls after initial text
-                    if "tool_calls" in delta:
+                    if delta.get("tool_calls"):  # guard: None/empty → skip
                         is_tool = True
                         _acc_tool_calls(tool_acc, delta["tool_calls"])
                         # Don't yield tool_call chunks to OWT — handle internally
@@ -965,8 +965,22 @@ async def _stream_with_tool_loop(
                 msgs = await _compress_context(msgs, model)
                 continue  # next iteration with compressed context
 
-            # Empty response: warn user (stream_with_fallback will try next model)
+            # Empty response handling
             if not "".join(full_text).strip():
+                if in_think_block:
+                    # Model generated reasoning tokens but no visible content or tool call
+                    # (hit token limit mid-think, or stopped without outputting a response).
+                    # Push it to actually respond rather than silently failing.
+                    msgs.append({
+                        "role": "user",
+                        "content": (
+                            "Deine Antwort enthielt keinen sichtbaren Text. "
+                            "Antworte jetzt direkt mit Text ODER rufe sofort ein Tool auf — "
+                            "kein weiteres Nachdenken."
+                        ),
+                    })
+                    continue  # use next iteration to get an actual response
+                # True empty response (no reasoning, no content, no tool call)
                 yield _sse_chunk(
                     "\n\n⚠️ **Modell hat keine Antwort geliefert** — bitte erneut versuchen "
                     "oder Aufgabe umformulieren.\n"
