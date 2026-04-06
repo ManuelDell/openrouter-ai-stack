@@ -793,11 +793,25 @@ async def _stream_with_tool_loop(
     )
     existing_system = [m for m in msgs if m.get("role") == "system"]
     if existing_system:
-        # Append hint to the last system message
         last_sys = existing_system[-1]
         last_sys["content"] = last_sys["content"].rstrip() + "\n\n" + _TOOL_HINT
     else:
         msgs.insert(0, {"role": "system", "content": _TOOL_HINT})
+
+    # For deep research (denker default or medium/high effort): inject research strategy.
+    # This shifts the model from "answer when it feels like enough" (shallow) to
+    # "cover all angles and verify" (Perplexity-style coverage-based stopping).
+    if max_iterations >= 15:
+        _RESEARCH_HINT = (
+            "\n\nFür Recherche-Aufgaben — Strategie:\n"
+            "• PLANE: Identifiziere 5–8 Teilfragen die vollständig beantwortet sein müssen\n"
+            "• WINKEL: Suche aus verschiedenen Perspektiven (offizielle Quellen, News, Experten, Kritiker)\n"
+            "• VERTIEFE: Wenn eine Suche etwas Wichtiges zeigt — suche gezielt mehr dazu\n"
+            "• COVERAGE: Stoppe erst wenn alle Teilfragen mit Quellen belegt sind\n"
+            "• VERIFIZIERE: Wichtige Fakten aus mindestens 2 unabhängigen Quellen bestätigen"
+        )
+        sys_msg = next(m for m in msgs if m.get("role") == "system")
+        sys_msg["content"] = sys_msg["content"].rstrip() + _RESEARCH_HINT
 
     for iteration in range(max_iterations):
         pre_buffer: list[bytes] = []   # chunks before we know text vs. tool-call
@@ -993,10 +1007,11 @@ async def _stream_with_tool_loop(
             msgs.append({
                 "role": "user",
                 "content": (
-                    "[SYSTEM-CHECK] Überprüfe deinen bisherigen Fortschritt: "
-                    "Hast du ausreichend Informationen um die ursprüngliche Aufgabe vollständig "
-                    "zu beantworten? Wenn ja — antworte jetzt mit deinen Erkenntnissen. "
-                    "Wenn nein — erkläre in einem Satz was noch fehlt und mache weiter."
+                    "[RECHERCHE-CHECK] Welche der ursprünglichen Schlüsselaspekte "
+                    "sind NOCH NICHT mit konkreten Quellen belegt? "
+                    "Liste sie explizit auf. "
+                    "Wenn Lücken existieren: suche gezielt danach — antworte NICHT zuerst. "
+                    "Antworte nur wenn ALLE wichtigen Aspekte durch Quellen abgedeckt sind."
                 ),
             })
 
