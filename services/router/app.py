@@ -32,7 +32,7 @@ from utils.cost_tracker import store_cost
 from routes.cost_routes import router as cost_router
 from tools.definitions import TOOL_DEFINITIONS
 from tools.executor import execute_tool
-from models.class_router import ALIASES, CODING_CLASSES, resolve_class_chain, increment_usage, get_class_status
+from models.class_router import ALIASES, CODING_CLASSES, resolve_class_chain, increment_usage, get_class_status, get_model_limit
 
 # ─── Logging ─────────────────────────────────────────────────
 
@@ -57,6 +57,22 @@ MODEL_FALLBACK   = os.getenv("MODEL_FALLBACK", "google/gemini-3.1-flash-lite-pre
 COMPLEXITY_THRESHOLD = int(os.getenv("COMPLEXITY_THRESHOLD", "150"))
 CACHE_TTL            = int(os.getenv("CACHE_TTL", "3600"))
 RATE_LIMIT_RPM       = int(os.getenv("RATE_LIMIT_RPM", "60"))
+
+# Context window sizes (tokens) per model — for proactive compression at 80%.
+# Conservative fallback for unknown models.
+_CONTEXT_WINDOWS: dict[str, int] = {
+    "qwen/qwq-32b":                              131072,
+    "qwen/qwen3-next-80b-a3b-instruct:free":     131072,
+    "meta-llama/llama-3.3-70b-instruct:free":    131072,
+    "nousresearch/hermes-3-llama-3.1-405b:free": 131072,
+    "deepseek/deepseek-r1":                      163840,
+    "deepseek/deepseek-r1:free":                 163840,
+    "google/gemini-2.5-flash-lite":             1048576,
+    "google/gemini-2.5-flash":                  1048576,
+    "google/gemma-3-27b-it:free":                131072,
+    "google/gemma-3-12b-it:free":                131072,
+}
+_CONTEXT_FALLBACK = 32768  # conservative for unknown models
 HTTP_REFERER         = os.getenv("HTTP_REFERER", "http://localhost:8080")
 X_TITLE              = os.getenv("X_TITLE", "OpenRouter AI Stack")
 
@@ -702,6 +718,41 @@ async def _compress_context(msgs: list[dict], model: str) -> list[dict]:
     ]
 
 
+async def _should_compress(model: str, usage: dict, msgs: list[dict], redis) -> bool:
+    """
+    Two triggers for proactive context compression:
+    1. Token usage ≥ 80% of model's context window (precise, model-aware).
+       Falls back to char count when the model doesn't return streaming usage.
+    2. Free model has only one daily request remaining — compress before the
+       inevitable model switch so the new model gets a clean, compact context.
+    """
+    prompt_tokens = usage.get("prompt_tokens", 0)
+
+    # Trigger 1a: token-based (preferred — precise)
+    if prompt_tokens > 0:
+        ctx_window = _CONTEXT_WINDOWS.get(model, _CONTEXT_FALLBACK)
+        if prompt_tokens >= 0.8 * ctx_window:
+            log.info("Compress: %d/%d tokens (%.0f%%) for %s",
+                     prompt_tokens, ctx_window, 100 * prompt_tokens / ctx_window, model)
+            return True
+
+    # Trigger 1b: char-based fallback (when usage not in stream)
+    elif sum(len(str(m.get("content") or "")) for m in msgs) > 80_000:
+        log.info("Compress: char threshold exceeded for %s", model)
+        return True
+
+    # Trigger 2: free model about to exhaust daily limit
+    limit = get_model_limit(model)
+    if limit is not None:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        used = int(await redis.get(f"model_usage:{model}:{today}") or 0)
+        if used >= limit - 1:
+            log.info("Compress: free model %s at %d/%d — pre-switch compression", model, used, limit)
+            return True
+
+    return False
+
+
 def _acc_tool_calls(acc: dict[int, dict], tool_calls_delta: list) -> None:
     """Merge streaming tool-call delta chunks into acc[index]."""
     for tc in tool_calls_delta:
@@ -999,13 +1050,11 @@ async def _stream_with_tool_loop(
         yield _sse_chunk("</think>\n\n")
 
         # ── Proactive context compression ─────────────────────────────────
-        # A 500 in-stream crash from QwQ (context overflow) is NOT caught by
-        # finish_reason=length, so compress proactively before the context
-        # explodes. Threshold ~80k chars ≈ 20k tokens — safe for all models.
-        total_chars = sum(len(str(m.get("content") or "")) for m in msgs)
-        if total_chars > 80_000:
+        # Triggers: (1) ≥80% of model's context window, OR
+        #           (2) free model has one daily request remaining.
+        if await _should_compress(model, usage, msgs, _redis):
             yield _sse_chunk(
-                "\n\n📝 *Kontext wächst — komprimiere Gesprächsverlauf...*\n\n"
+                "\n\n📝 *Kontext komprimieren — fasse bisherigen Fortschritt zusammen...*\n\n"
             )
             msgs = await _compress_context(msgs, model)
 

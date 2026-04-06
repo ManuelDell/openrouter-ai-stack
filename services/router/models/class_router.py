@@ -119,6 +119,15 @@ async def resolve_class_model(class_name: str, redis, need_tools: bool = False) 
     return chain[0]
 
 
+def get_model_limit(model_id: str) -> Optional[int]:
+    """Return the daily request limit for a model, or None if unlimited (paid)."""
+    for tiers in MODEL_CLASSES.values():
+        for tier in tiers:
+            if tier["model"] == model_id:
+                return tier.get("limit")
+    return None
+
+
 async def increment_usage(model: str, redis) -> None:
     """Zählt einen Request für das heutige Tages-Limit.
     Key läuft um Mitternacht UTC + 1h Puffer ab."""
